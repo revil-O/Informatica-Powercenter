@@ -67,20 +67,37 @@ Get-Command pmrep
 Auf einem Windows-Client braucht pmrep die Domain-Datei. Meldet `connect` einen Fehler zu `domains.infa`,
 die Variable setzen: `$env:INFA_DOMAINS_FILE = "C:\Informatica\10.5.0\domains.infa"` (Pfad je Installation).
 
-**Verbinden ohne Passwort auf der Kommandozeile.** pmrep liest das Passwort mit `-X` aus einer Umgebungsvariable:
+**Verbinden.** `pmrep connect -X <VARIABLE>` liest das Passwort aus einer Umgebungsvariable - diese muss
+das mit **`pmpasswd` verschluesselte** Passwort enthalten, nicht den Klartext.
+
+Variante A - verschluesseltes Passwort (empfohlen, auch fuer automatisierte Laeufe). `pmpasswd` einmalig aufrufen,
+den Wert zwischen `-->` und `<--` aus der Zeile `Encrypted string` uebernehmen:
 
 ```bash
-read -rs -p "Passwort: " INFA_PASSWORD; echo; export INFA_PASSWORD
+pmpasswd 'MeinPasswort'                      # danach: history -d $((HISTCMD-1)) bzw. Shell-History leeren
+export INFA_PASSWORD='<verschluesselter Wert>'
 pmrep connect -r PM_PROD_REPO -d Prod_Domain -n admin -X INFA_PASSWORD
-unset INFA_PASSWORD
+```
+```powershell
+pmpasswd 'MeinPasswort'                      # danach: Clear-History; PSReadLine-Verlauf ggf. bereinigen
+$env:INFA_PASSWORD = '<verschluesselter Wert>'
+pmrep connect -r PM_PROD_REPO -d Prod_Domain -n admin -X INFA_PASSWORD
+```
+
+Variante B - interaktiv mit Klartext-Passwort (`-x`). Das Passwort steht nur waehrend des `connect`-Aufrufs
+in der Prozessliste:
+
+```bash
+read -rs -p "Passwort: " PW; echo
+pmrep connect -r PM_PROD_REPO -d Prod_Domain -n admin -x "$PW"
+unset PW
 ```
 ```powershell
 $sec  = Read-Host -AsSecureString "Passwort"
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-$env:INFA_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-pmrep connect -r PM_PROD_REPO -d Prod_Domain -n admin -X INFA_PASSWORD
-Remove-Item Env:INFA_PASSWORD
+try {
+  pmrep connect -r PM_PROD_REPO -d Prod_Domain -n admin -x ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr))
+} finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 ```
 
 Die Verbindung gilt fuer alle folgenden pmrep-Aufrufe in derselben Shell. Fuer Schritt 2 (Quell-Repository)
@@ -346,7 +363,7 @@ Im Import-Log achten auf:
 
 ## Checkliste
 
-- [ ] pmrep im PATH, Verbindung mit `-X` (Passwort nicht auf der Kommandozeile)
+- [ ] pmrep im PATH, Verbindung mit `-X` und pmpasswd-verschluesseltem Passwort (oder interaktiv mit `-x`)
 - [ ] Backup vorhanden
 - [ ] Schritt 1 ausgefuehrt, neuer Trockenlauf
 - [ ] Original-Export auf Workflow-Ebene (`-m -s -b -r`)

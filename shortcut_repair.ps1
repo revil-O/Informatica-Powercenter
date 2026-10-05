@@ -18,7 +18,8 @@
 .EXAMPLE
   .\shortcut_repair.ps1 -Repository PM_PROD_REPO -Domain Prod_Domain -User admin -Folder DWH -Execute
 
-  Passwort: Umgebungsvariable INFA_PASSWORD, sonst interaktive Abfrage.
+  Passwort: Umgebungsvariable INFA_PASSWORD mit dem pmpasswd-verschluesselten Passwort
+  (pmrep connect -X), sonst interaktive Abfrage (pmrep connect -x).
 #>
 [CmdletBinding()]
 param(
@@ -78,7 +79,6 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # eigene Verbindungsdatei, damit kein fremdes pmrep.cnx ueberschrieben wird
 $prevCnxInfo = $env:INFA_REPCNX_INFO
-$createdPassword = $false
 if (-not $NoConnect) { $env:INFA_REPCNX_INFO = Join-Path $OutDir 'pmrep.cnx' }
 
 function Write-Log([string]$Text) {
@@ -149,24 +149,26 @@ Write-Log ("[INFO] - Repository={0} Folder={1} Typen={2} Ausgabe={3}" -f $repoTe
 
 try {
   if (-not $NoConnect) {
-    if (-not $env:INFA_PASSWORD) {
+    $conn = @('connect', '-r', $Repository, '-d', $Domain, '-n', $User)
+    if ($SecurityDomain) { $conn += @('-s', $SecurityDomain) }
+    if ($env:INFA_PASSWORD) {
+      # -X erwartet das mit pmpasswd verschluesselte Passwort in der Umgebungsvariable
+      $connected = Invoke-Pmrep ($conn + @('-X', 'INFA_PASSWORD')) (Join-Path $LogDir 'connect.txt')
+    } else {
       $sec = Read-Host -AsSecureString ("Passwort fuer {0}" -f $User)
       $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+      $plain = $null
       try {
-        $env:INFA_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        $createdPassword = $true
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $connected = Invoke-Pmrep ($conn + @('-x', $plain)) (Join-Path $LogDir 'connect.txt')
       } finally {
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-        $sec.Dispose()
+        $sec.Dispose(); $plain = $null
       }
     }
-    $conn = @('connect', '-r', $Repository, '-d', $Domain, '-n', $User, '-X', 'INFA_PASSWORD')
-    if ($SecurityDomain) { $conn += @('-s', $SecurityDomain) }
-    $connected = Invoke-Pmrep $conn (Join-Path $LogDir 'connect.txt')
-    # selbst abgefragtes Passwort sofort wieder entfernen (nur fuer connect noetig)
-    if ($createdPassword) { Remove-Item Env:INFA_PASSWORD -ErrorAction SilentlyContinue; $createdPassword = $false }
     if (-not $connected) {
       Write-Log ("[FEHLER] - Verbindung fehlgeschlagen, siehe {0}" -f (Join-Path $LogDir 'connect.txt'))
+      if ($env:INFA_PASSWORD) { Write-Log '[HINWEIS] - INFA_PASSWORD muss das mit pmpasswd verschluesselte Passwort enthalten (pmpasswd <passwort>)' }
       exit 1
     }
     Write-Log "[STATUS] - verbunden mit $Repository"
@@ -420,7 +422,6 @@ try {
 finally {
   if (-not $NoConnect -and $env:INFA_REPCNX_INFO -and (Test-Path $env:INFA_REPCNX_INFO)) { Remove-Item $env:INFA_REPCNX_INFO -Force }
   # nur selbst gesetzte Umgebungswerte zuruecknehmen
-  if ($createdPassword) { Remove-Item Env:INFA_PASSWORD -ErrorAction SilentlyContinue }
   if (-not $NoConnect) {
     if ($null -eq $prevCnxInfo) { Remove-Item Env:INFA_REPCNX_INFO -ErrorAction SilentlyContinue } else { $env:INFA_REPCNX_INFO = $prevCnxInfo }
   }

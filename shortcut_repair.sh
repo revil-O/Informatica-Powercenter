@@ -37,7 +37,8 @@ Optional:
   --yes             keine Rueckfrage bei --execute
   -h | --help       diese Hilfe
 
-Passwort: Umgebungsvariable INFA_PASSWORD, sonst interaktive Abfrage.
+Passwort: Umgebungsvariable INFA_PASSWORD mit dem pmpasswd-verschluesselten Passwort
+(pmrep connect -X), sonst interaktive Abfrage (pmrep connect -x).
 EOF
 }
 
@@ -155,19 +156,23 @@ cleanup() { if [ $DO_CONNECT -eq 1 ]; then rm -f "$INFA_REPCNX_INFO"; fi; }
 trap cleanup EXIT
 
 if [ $DO_CONNECT -eq 1 ]; then
-  if [ -z "${INFA_PASSWORD:-}" ]; then
-    printf 'Passwort fuer %s: ' "$REPUSER"
-    stty -echo 2>/dev/null; read -r INFA_PASSWORD; stty echo 2>/dev/null; echo
-  fi
-  export INFA_PASSWORD
-  CONN=(connect -r "$REPO" -d "$DOMAIN" -n "$REPUSER" -X INFA_PASSWORD)
+  CONN=(connect -r "$REPO" -d "$DOMAIN" -n "$REPUSER")
   [ -n "$SECDOMAIN" ] && CONN+=(-s "$SECDOMAIN")
-  "$PMREP" "${CONN[@]}" > "$OUTDIR/log/connect.txt" 2>&1
+  if [ -n "${INFA_PASSWORD:-}" ]; then
+    # -X erwartet das mit pmpasswd verschluesselte Passwort in der Umgebungsvariable
+    CONN+=(-X INFA_PASSWORD)
+    "$PMREP" "${CONN[@]}" > "$OUTDIR/log/connect.txt" 2>&1
+  else
+    printf 'Passwort fuer %s: ' "$REPUSER"
+    stty -echo 2>/dev/null; read -r PW_PLAIN; stty echo 2>/dev/null; echo
+    "$PMREP" "${CONN[@]}" -x "$PW_PLAIN" > "$OUTDIR/log/connect.txt" 2>&1
+  fi
   RC=$?
-  # Passwort wird nur fuer connect gebraucht - nicht an weitere pmrep-Aufrufe vererben
-  unset INFA_PASSWORD
+  PW_PLAIN=""
   if [ $RC -ne 0 ]; then
-    log "[FEHLER] - Verbindung fehlgeschlagen, siehe $OUTDIR/log/connect.txt"; exit 1
+    log "[FEHLER] - Verbindung fehlgeschlagen, siehe $OUTDIR/log/connect.txt"
+    [ -n "${INFA_PASSWORD:-}" ] && log "[HINWEIS] - INFA_PASSWORD muss das mit pmpasswd verschluesselte Passwort enthalten (pmpasswd <passwort>)"
+    exit 1
   fi
   log "[STATUS] - verbunden mit $REPO"
 fi

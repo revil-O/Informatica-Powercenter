@@ -22,7 +22,8 @@ Bash fuer Linux-Server, PowerShell (5.1 / 7) fuer Windows - gleiche Logik, gleic
 # Windows - Plan ausfuehren
 .\shortcut_repair.ps1 -Repository PM_PROD_REPO -Domain Prod_Domain -User admin -Folder DWH -Execute
 ```
-Passwort ueber Umgebungsvariable `INFA_PASSWORD` oder interaktive Abfrage (wird per `pmrep connect -X` uebergeben).
+Passwort: Umgebungsvariable `INFA_PASSWORD` mit dem **mit `pmpasswd` verschluesselten** Passwort (wird per
+`pmrep connect -X` uebergeben), sonst interaktive Abfrage (`pmrep connect -x`).
 Hilfe: `./shortcut_repair.sh -h` bzw. `Get-Help .\shortcut_repair.ps1 -Full`.
 
 ### Windows (PowerShell / Eingabeaufforderung)
@@ -49,10 +50,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 Auf einem Client braucht pmrep die Domain-Datei. Meldet die Verbindung einen Fehler zu `domains.infa`:
 `$env:INFA_DOMAINS_FILE = "C:\Informatica\10.5.0\domains.infa"` (Pfad je Installation).
 
-**Passwort ohne Abfrage** (z.B. fuer einen geplanten Lauf) - nur fuer die aktuelle Sitzung setzen, danach entfernen:
+**Passwort ohne Abfrage** (z.B. fuer einen geplanten Lauf) - das mit `pmpasswd` verschluesselte Passwort
+(Wert zwischen `-->` und `<--` der Ausgabe von `pmpasswd <passwort>`) nur fuer die aktuelle Sitzung setzen:
 
 ```powershell
-$env:INFA_PASSWORD = "..."     # besser: aus einem Tresor/Credential Store lesen
+$env:INFA_PASSWORD = "<pmpasswd-verschluesselt>"
 .\shortcut_repair.ps1 -Repository PM_PROD_REPO -Domain Prod_Domain -User admin -Folder DWH
 Remove-Item Env:INFA_PASSWORD
 ```
@@ -124,7 +126,7 @@ verwaiste Shortcuts sind als Kommentar aufgefuehrt und muessen vor dem Import ge
 Hinweise:
 - Vorher Repository-Backup (`pmrep backup`) ziehen.
 - `--no-connect` / `-NoConnect` nutzt eine bestehende pmrep-Verbindung; dann ist `-r`/`-R` bzw. `-Repository`/`-SourceRepository` trotzdem Pflicht (fuer das Control-File).
-- Ein interaktiv abgefragtes Passwort wird nur fuer `pmrep connect` gesetzt und danach sofort wieder entfernt.
+- Ein interaktiv abgefragtes Passwort wird nur fuer `pmrep connect` verwendet (`-x`) und danach sofort verworfen.
 - Versioniertes Repository: geloeschte Objekte einchecken, ggf. `pmrep purgeversion`.
 - Das Parsing der `listobjects`-Ausgabe kann je nach PowerCenter-Version abweichen - erst Trockenlauf und `report.csv` pruefen.
   Notfalls Objektliste selbst vorgeben: `-L objekte.txt` / `-ObjectFile objekte.txt` (Zeilen `typ|name[|subtyp]`, Sources als `DBD.NAME`).
