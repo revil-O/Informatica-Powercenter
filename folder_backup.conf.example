@@ -1,0 +1,38 @@
+# Konfiguration fuer folder_backup.sh / folder_backup.ps1  (KEY=VALUE, Kommentare mit #)
+# Kommandozeilen-Optionen haben Vorrang vor diesen Werten.
+# Das Passwort gehoert NICHT hierher: Umgebungsvariable (PASSVAR) mit pmpasswd-verschluesseltem Wert.
+
+# --- Verbindung
+REPO=PM_PROD
+DOMAIN=Dom_Prod
+USER=svc_infa_backup
+#SECDOMAIN=LDAP_CORP
+PASSVAR=INFA_PASSWORD
+#PMREP=/opt/informatica/10.5.0/server/bin/pmrep
+
+# --- Umfang
+# leer = alle Folder
+FOLDERS=
+# leer = automatisch erkennen (Probe-Export je Folder); explizit angeben spart Zeit
+SHARED=SHARED
+# Folder ausschliessen (erweiterter Regex)
+EXCLUDE=^(TMP|SANDBOX)_
+TYPES=source,target,User Defined Function,transformation,mapplet,mapping,sessionconfig,session,worklet,workflow
+# objects = ein XML pro Objekt nach Typ gruppiert, workflows = ein XML pro Workflow
+MODE=objects
+# full = jede Datei einzeln importierbar (-m -s -b -r), none = nur das Objekt
+DEPS=full
+
+# --- Ablage und Betrieb
+BASEDIR=/data/infa_backup/folder
+RETRIES=2
+# nur die N neuesten erfolgreichen Backups behalten (0 = alle)
+KEEP=14
+MIN_FREE_MB=2000
+# Abbruch ab N Fehlern (0 = nie)
+MAX_ERRORS=50
+FAIL_FAST=0
+# 1 = Exitcode 0 auch bei einzelnen Fehlern (Status bleibt PARTIAL)
+PARTIAL_OK=0
+# 1 = jeden fehlerfreien Folder packen (.tar.gz unter Linux, .zip unter Windows)
+ZIP=0

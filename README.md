@@ -1,6 +1,27 @@
 # Informatica-Powercenter
 Scripts &amp; useful things (administration) for data integration development using Informatica Powercenter
 
+## folder_backup.sh / folder_backup.ps1
+
+Folderweises Backup des Repositorys als importierbare XML-Exporte: erst die Shared Folder, danach alle anderen,
+je Folder ein XML pro Objekt - gruppiert nach Typ in Import-Reihenfolge (`01_source` ... `11_workflow`) -
+oder ein selbststaendiges XML pro Workflow. Mit Pruefung jeder Datei, Wiederholung bei Fehlern, Manifest mit
+SHA256, Statusdatei, Aufbewahrung, Sperre gegen Doppelstart und Exitcodes fuer den Command Task eines Workflows.
+Ergaenzt `pmrep backup`, ersetzt es nicht (Connections, Berechtigungen u.a. sind nicht in den XML-Exporten).
+
+```bash
+./folder_backup.sh -c folder_backup.conf --list      # Trockenlauf: Folder und Objektanzahl
+./folder_backup.sh -c folder_backup.conf             # Backup
+```
+```powershell
+.\folder_backup.ps1 -ConfigFile .\folder_backup.conf -List
+.\folder_backup.ps1 -ConfigFile .\folder_backup.conf
+```
+
+Konfiguration: `folder_backup.conf.example`. Passwort als Umgebungsvariable `INFA_PASSWORD` (mit `pmpasswd` verschluesselt).
+Exitcodes: `0` = SUCCESS, `1` = PARTIAL, `2` = FAILED.
+Howto mit Einrichtung, Workflow-Steuerung, Fehlerbehandlung und Restore: [docs/FOLDER_BACKUP.md](docs/FOLDER_BACKUP.md)
+
 ## shortcut_repair.sh / shortcut_repair.ps1
 
 Repariert Shortcuts nach einem fehlgeschlagenen Import (REPLACE im Control-File):
