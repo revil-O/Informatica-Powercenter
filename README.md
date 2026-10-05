@@ -1,7 +1,7 @@
 # Informatica-Powercenter
 Scripts &amp; useful things (administration) for data integration development using Informatica Powercenter
 
-## folder_backup.sh / folder_backup.ps1
+## folder_backup / folder_restore (sh + ps1)
 
 Folderweises Backup des Repositorys als importierbare XML-Exporte: erst die Shared Folder, danach alle anderen,
 je Folder ein XML pro Objekt - gruppiert nach Typ in Import-Reihenfolge (`01_source` ... `11_workflow`) -
@@ -18,9 +18,25 @@ Ergaenzt `pmrep backup`, ersetzt es nicht (Connections, Berechtigungen u.a. sind
 .\folder_backup.ps1 -ConfigFile .\folder_backup.conf
 ```
 
+Optional versioniert in Git (`--git` / `-GitRepo`): Aenderungshistorie je Objekt, Zeitstempel im XML-Kopf neutralisiert,
+fehlgeschlagene Exporte behalten ihre letzte Version.
+
+`folder_restore.sh` / `folder_restore.ps1` spielt einen Lauf wieder ein - alles, einzelne Folder oder Objekte, in
+Import-Reihenfolge, mit Pruefsummenkontrolle, Auswertung der Import-Logs (`renamed` = Duplikat) und optionaler Validierung.
+Standard ist Trockenlauf; mit `--create-folders` auch als Probe-Restore in ein Sandbox-Repository.
+
+```bash
+./folder_restore.sh -c folder_backup.conf                                   # Trockenlauf, letzter erfolgreicher Lauf
+./folder_restore.sh -c folder_backup.conf -r PM_SANDBOX --create-folders --validate --execute --yes
+```
+```powershell
+.\folder_restore.ps1 -ConfigFile .\folder_backup.conf
+.\folder_restore.ps1 -ConfigFile .\folder_backup.conf -Repository PM_SANDBOX -CreateFolders -Validate -Execute -Yes
+```
+
 Konfiguration: `folder_backup.conf.example`. Passwort als Umgebungsvariable `INFA_PASSWORD` (mit `pmpasswd` verschluesselt).
 Exitcodes: `0` = SUCCESS, `1` = PARTIAL, `2` = FAILED.
-Howto mit Einrichtung, Workflow-Steuerung, Fehlerbehandlung und Restore: [docs/FOLDER_BACKUP.md](docs/FOLDER_BACKUP.md)
+Howto mit Einrichtung, Git, Workflow-Steuerung, Fehlerbehandlung, Restore und Probe-Restore: [docs/FOLDER_BACKUP.md](docs/FOLDER_BACKUP.md)
 
 ## shortcut_repair.sh / shortcut_repair.ps1
 

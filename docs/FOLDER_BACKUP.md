@@ -1,8 +1,9 @@
 # Folderweises Repository-Backup mit pmrep
 
-Howto fuer `folder_backup.sh` (Linux) und `folder_backup.ps1` (Windows): Sicherung eines PowerCenter-Repositorys
-**Folder fuer Folder** als importierbare XML-Exporte - erst die Shared Folder, danach alle anderen,
-gruppiert nach Objekttyp in Import-Reihenfolge. Steuerbar als Command Task aus einem Workflow.
+Howto fuer `folder_backup.sh` / `folder_backup.ps1` und `folder_restore.sh` / `folder_restore.ps1`
+(Linux / Windows): Sicherung eines PowerCenter-Repositorys **Folder fuer Folder** als importierbare
+XML-Exporte - erst die Shared Folder, danach alle anderen, gruppiert nach Objekttyp in Import-Reihenfolge -,
+optional versioniert in Git, mit Restore-Skript und Probe-Restore. Steuerbar als Command Task aus einem Workflow.
 
 ## Wozu - und wozu nicht
 
@@ -93,6 +94,9 @@ bricht es dann mit Exitcode 2 ab.
 | `FAIL_FAST` | `--fail-fast` | `-FailFast` | beim ersten Fehler abbrechen (`1`/`0`) |
 | `PARTIAL_OK` | `--partial-ok` | `-PartialOk` | Exitcode 0 auch bei einzelnen Fehlern (`1`/`0`) |
 | `ZIP` | `--zip` | `-Zip` | fehlerfreie Folder packen (`1`/`0`) |
+| `GIT_REPO` | `--git` | `-GitRepo` | Exporte zusaetzlich in dieses Git-Repository uebernehmen (siehe unten) |
+| `GIT_AUTHOR` | `--git-author` | `-GitAuthor` | Autor der Commits, `Name <mail>` |
+| `GIT_PUSH` | `--git-push` | `-GitPush` | nach dem Commit pushen (`1`/`0`) |
 | - | `--list` | `-List` | Trockenlauf: nur Folder und Objektanzahl |
 
 Kommandozeilen-Optionen ueberschreiben Werte aus der Konfigurationsdatei.
@@ -196,6 +200,60 @@ als das N-te erfolgreiche Backup - fehlgeschlagene Laeufe dazwischen inklusive. 
 mindestens N gute Backups. Pro Job ein eigenes `BASEDIR` verwenden, sonst raeumen sich Jobs mit
 unterschiedlichem Umfang gegenseitig auf.
 
+## Versionierung mit Git
+
+Mit `GIT_REPO` (bzw. `--git` / `-GitRepo`) uebernimmt jeder Lauf die Exporte zusaetzlich in ein
+Git-Repository und committet die Aenderungen. So entsteht eine **Aenderungshistorie je Objekt**:
+wer wann was an einem Mapping geaendert hat, laesst sich mit `git log` / `git diff` nachvollziehen,
+und jede fruehere Version ist abrufbar - auch wenn die Backup-Laeufe laengst aufgeraeumt sind.
+
+```
+<GIT_REPO>/
+├── .gitattributes                 *.xml -text diff (keine Zeilenende-Konvertierung)
+└── PM_PROD/
+    ├── SHARED/01_source/ORA.CUST.xml
+    ├── DWH/06_mapping/m_load_sales.xml
+    └── DWH/import_ctrl.xml
+```
+
+| Regel | Grund |
+|---|---|
+| `CREATION_DATE` im XML-Kopf wird auf `01/01/1970 00:00:00` gesetzt | sonst aendert sich jede Datei bei jedem Lauf |
+| identischer Stand → kein Commit | `[GIT] - keine Aenderungen gegenueber dem letzten Backup` |
+| Objekt nicht mehr im Repository → Datei wird geloescht | Historie bleibt in Git erhalten |
+| Export eines Objekts fehlgeschlagen → **letzte Version bleibt** | ein Fehler soll kein Loeschen vortaeuschen |
+| Objektliste eines Folders nicht lesbar → in diesem Folder wird nichts geloescht | dito |
+| Lauf mit `FOLDERS` (Teilmenge) → nur diese Folder werden angefasst | |
+| Folder existiert nicht mehr (nur bei Sicherung aller Folder, nicht bei `EXCLUDE`) → wird entfernt | |
+| Commit-Nachricht | `Backup PM_PROD 20261005_220000 (SUCCESS): 2 neu, 5 geaendert, 1 geloescht` |
+| Git-Fehler (init, commit, push) | `FEHLER` im Lauf → Status `PARTIAL`; das Backup selbst bleibt gueltig |
+
+Die Git-Kopien sind fuer **Historie und Vergleich** gedacht. Fuer den Restore die Backup-Laeufe verwenden
+(unveraendert, mit Pruefsummen). Eine aeltere Version aus Git zurueckholen:
+
+```bash
+cd <GIT_REPO>
+git log --oneline -- PM_PROD/DWH/06_mapping/m_load_sales.xml          # Historie eines Mappings
+git diff HEAD~1 -- PM_PROD/DWH/06_mapping/m_load_sales.xml            # letzte Aenderung
+git show <commit>:PM_PROD/DWH/06_mapping/m_load_sales.xml > m_load_sales_alt.xml
+pmrep objectimport -i m_load_sales_alt.xml -c PM_PROD/DWH/import_ctrl.xml   # impcntl.dtd daneben legen
+```
+```powershell
+Set-Location <GIT_REPO>
+git log --oneline -- PM_PROD/DWH/06_mapping/m_load_sales.xml
+git show "<commit>:PM_PROD/DWH/06_mapping/m_load_sales.xml" | Set-Content -Encoding Default m_load_sales_alt.xml
+```
+
+**Einrichtung:** `git` muss auf dem ausfuehrenden Rechner installiert sein. Das Repository wird beim ersten
+Lauf angelegt. Fuer einen zentralen Server einmalig ein Remote einrichten und `GIT_PUSH=1` setzen:
+
+```bash
+git -C <GIT_REPO> remote add origin <url> && git -C <GIT_REPO> push -u origin HEAD
+```
+
+Der Autor kommt aus `GIT_AUTHOR` oder der git-Konfiguration des Service-Users. Zugangsdaten fuer den Push
+(SSH-Schluessel oder Credential Helper) gehoeren zum Service-User, nicht in die Konfigurationsdatei.
+
 ## Steuerung aus einem Workflow
 
 Empfohlen ist ein eigener Admin-Workflow mit einem **Command Task** (statt eines Pre-/Post-Session-Commands
@@ -242,54 +300,116 @@ $PMRootDir/scripts/folder_backup.sh -c $PMRootDir/scripts/folder_backup.conf -F 
 Der Workflow-User braucht Leserechte auf die Folder; das Skript laeuft unter dem Betriebssystem-User
 des Integration Service - dieser braucht Schreibrecht auf `BASEDIR`.
 
-## Restore
+## Restore mit folder_restore
 
-**Vorbereitung**
-1. Laufverzeichnis waehlen - Name steht in `<BASEDIR>/LATEST_SUCCESS`. Bei `PARTIAL` im `manifest.csv`
-   pruefen, welche Objekte fehlen.
-2. Gepackte Folder auspacken (`tar xzf DWH.tar.gz` bzw. `Expand-Archive DWH.zip .`).
-3. `impcntl.dtd` neben jedes `import_ctrl.xml` kopieren (der `DOCTYPE` verweist relativ darauf).
-4. Bei Import in ein **anderes** Repository in jedem `import_ctrl.xml` `TARGETREPOSITORYNAME` anpassen.
-5. Mit dem Ziel-Repository verbinden (`pmrep connect ... -X INFA_PASSWORD`).
+`folder_restore.sh` / `folder_restore.ps1` importiert aus einem Backup-Lauf - alles, einzelne Folder oder
+einzelne Objekte - in der Reihenfolge von `import_order.txt` (Shared Folder zuerst).
 
-**Alles in Reihenfolge importieren** (Shared Folder zuerst):
+**Standard ist Trockenlauf:** Dateien bereitstellen, Pruefsummen gegen `manifest.csv` pruefen, Ziel-Folder
+abgleichen, Plan schreiben. Importiert wird nur mit `--execute` / `-Execute` (mit Rueckfrage, ausser `--yes`).
+Der Backup-Lauf wird nie veraendert: alles passiert in einem Arbeitsverzeichnis `restore_<REPO>_<Zeitstempel>/`.
 
 ```bash
-cd /data/infa_backup/folder/$(cat /data/infa_backup/folder/LATEST_SUCCESS)
-for d in */; do cp "$INFA_HOME/server/bin/impcntl.dtd" "$d"; done
-mkdir -p restore_log
+# Trockenlauf: letzter erfolgreicher Lauf, ganzes Repository
+./folder_restore.sh -c folder_backup.conf
+# nur Folder DWH, ausfuehren
+./folder_restore.sh -c folder_backup.conf -F DWH --execute
+# ein einzelnes Mapping aus einem bestimmten Lauf
+./folder_restore.sh -c folder_backup.conf -L PM_PROD_20261005_220000 -O 'DWH/06_mapping/m_load_sales' --execute
+```
+```powershell
+.\folder_restore.ps1 -ConfigFile .\folder_backup.conf
+.\folder_restore.ps1 -ConfigFile .\folder_backup.conf -Folders DWH -Execute
+.\folder_restore.ps1 -ConfigFile .\folder_backup.conf -Run PM_PROD_20261005_220000 -ObjectFilter 'DWH/06_mapping/m_load_sales' -Execute
+```
+
+| Bash | PowerShell | Bedeutung |
+|---|---|---|
+| `-r REPO` | `-Repository` | **Ziel**-Repository; wird in allen Control-Files als `TARGETREPOSITORYNAME` gesetzt |
+| `-d`, `-n`, `-s`, `-X`, `-P` | `-Domain`, `-User`, `-SecurityDomain`, `-PasswordVar`, `-Pmrep` | Verbindung wie beim Backup |
+| `-b VERZ` | `-BackupDir` | Backup-Basisverzeichnis |
+| `-L LAUF` | `-Run` | Backup-Lauf (Name oder Pfad); Standard: `LATEST_SUCCESS` |
+| `-F A,B` | `-Folders` | nur diese Folder |
+| `-O REGEX` | `-ObjectFilter` | nur Dateien, deren Pfad passt |
+| `--dtd DATEI` | `-Dtd` | `impcntl.dtd` (Standard: neben pmrep bzw. `$INFA_HOME/server/bin`) |
+| `-w VERZ` | `-WorkDir` | Arbeitsverzeichnis |
+| `--create-folders` | `-CreateFolders` | fehlende Ziel-Folder anlegen (`pmrep createfolder`, Shared-Eigenschaft aus dem Backup) |
+| `--checkin TEXT` | `-Checkin` | versioniertes Repository: nach dem Import einchecken (`CHECKIN_AFTER_IMPORT`) |
+| `--validate` | `-Validate` | importierte Mappings, Mapplets, Sessions, Worklets, Workflows mit `pmrep validate` pruefen |
+| `--no-verify` | `-NoVerify` | Pruefsummen nicht kontrollieren |
+| `--fail-fast`, `--max-errors N` | `-FailFast`, `-MaxErrors` | Abbruchgrenzen |
+| `--execute`, `--yes` | `-Execute`, `-Yes` | importieren, ohne Rueckfrage |
+
+Aus der Konfigurationsdatei werden nur die Verbindungs-Schluessel (`REPO`, `DOMAIN`, `USER`, `SECDOMAIN`,
+`PASSVAR`, `PMREP`) und `BASEDIR` gelesen. **Achtung:** `REPO` ist beim Restore das Ziel - fuer einen Restore in
+ein anderes Repository `-r` / `-Repository` angeben oder eine eigene Konfiguration verwenden.
+
+**Was geprueft wird**
+
+| Pruefung | Reaktion |
+|---|---|
+| Backup-Lauf `RUNNING` (abgebrochen) | Abbruch, Exitcode 2 |
+| Backup-Lauf `PARTIAL` / `FAILED` | Warnung (fehlende Objekte stehen in `manifest.csv`) |
+| Folder-Verzeichnis fehlt | Archiv `.tar.gz` / `.zip` wird ausgepackt, sonst `FEHLER` |
+| Pruefsumme weicht von `manifest.csv` ab | `FEHLER`, Datei wird nicht importiert |
+| Ziel-Folder fehlt | `FEHLER` - oder mit `--create-folders` anlegen |
+| Import liefert Exitcode <> 0 oder Fehlerzeile | `FEHLER` im Report, Lauf geht weiter |
+| Verbindungsverlust | einmal neu verbinden und wiederholen |
+| Import meldet `renamed` | `WARNUNG` - ein Duplikat (z.B. `Shortcut_to_X1`) ist entstanden, siehe [REIMPORT.md](REIMPORT.md) |
+| `--validate`: Objekt ungueltig | `FEHLER`, Spalte `validierung` = `UNGUELTIG` |
+
+**Ergebnis** im Arbeitsverzeichnis: `restore_plan.txt` (alle pmrep-Befehle), `restore_report.csv`
+(`folder;datei;import;validierung;meldung`), `restore.log`, `log/` (Ausgabe je Import), `src/` (Kopie der
+importierten Dateien mit angepassten Control-Files). Exitcodes: `0` = OK, `1` = einzelne Fehler, `2` = Abbruch.
+
+## Probe-Restore in ein Sandbox-Repository
+
+> Ein Backup ist erst ein Backup, wenn der Restore geprobt wurde.
+
+Ein zweiter Admin-Workflow spielt den letzten erfolgreichen Lauf regelmaessig (z.B. woechentlich) in ein
+Sandbox-Repository ein und validiert die Workflows. Faellt der Probe-Restore aus, ist das Backup nicht
+verlaesslich - lange bevor es gebraucht wird.
+
+```
+wf_ADMIN_RESTORE_TEST
+  Start ──► cmd_RESTORE_TEST ──[Status = FAILED]──► eml_RESTORE_TEST_FAILED
+```
+
+Command (Linux bzw. Windows):
+
+```
+$PMRootDir/scripts/folder_restore.sh -c $PMRootDir/scripts/folder_backup.conf -r PM_SANDBOX --create-folders --validate --execute --yes
+```
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File $PMRootDir\scripts\folder_restore.ps1 -ConfigFile $PMRootDir\scripts\folder_backup.conf -Repository PM_SANDBOX -CreateFolders -Validate -Execute -Yes
+```
+
+Voraussetzungen: ein eigenes Sandbox-Repository (gleiche PowerCenter-Version) in derselben Domain, ein User mit
+Schreibrecht dort (und dem Recht, Folder anzulegen), dasselbe oder ein eigenes verschluesseltes Passwort
+(`PASSVAR`). Liegt die Sandbox in einer anderen Domain, eine eigene Konfigurationsdatei verwenden.
+Ungueltige Objekte nach dem Import deuten oft auf fehlende Connections oder Abhaengigkeiten in der Sandbox
+hin - sie sind nicht Teil der XML-Exporte.
+
+## Restore ohne Skript
+
+Falls `folder_restore` nicht verfuegbar ist - dieselbe Reihenfolge von Hand:
+
+1. Laufverzeichnis waehlen (`<BASEDIR>/LATEST_SUCCESS`), gepackte Folder auspacken.
+2. `impcntl.dtd` neben jedes `import_ctrl.xml` kopieren, bei anderem Ziel `TARGETREPOSITORYNAME` anpassen.
+3. Mit dem Ziel-Repository verbinden und `import_order.txt` abarbeiten:
+
+```bash
 while IFS='|' read -r FOLDER XML CTRL; do
-  pmrep objectimport -i "$XML" -c "$CTRL" -l "restore_log/$(echo "$XML" | tr '/' '_').log" \
-    || echo "FEHLER: $XML" | tee -a restore_log/fehler.txt
+  pmrep objectimport -i "$XML" -c "$CTRL" -l "restore_$(echo "$XML" | tr '/' '_').log" || echo "FEHLER: $XML"
 done < import_order.txt
 ```
 ```powershell
-$base = 'D:\infa_backup\folder'
-Set-Location (Join-Path $base (Get-Content (Join-Path $base 'LATEST_SUCCESS')))
-Get-ChildItem -Directory | Where-Object Name -ne 'log' | ForEach-Object { Copy-Item "$env:INFA_HOME\server\bin\impcntl.dtd" $_.FullName }
-New-Item -ItemType Directory -Force restore_log | Out-Null
 foreach ($line in Get-Content .\import_order.txt) {
   $folder, $xml, $ctrl = $line -split '\|'
-  $log = Join-Path $PWD ('restore_log\' + ($xml -replace '[\\/]', '_') + '.log')
-  pmrep objectimport -i (Join-Path $PWD $xml) -c (Join-Path $PWD $ctrl) -l $log
-  if ($LASTEXITCODE -ne 0) { "FEHLER: $xml" | Tee-Object -Append restore_log\fehler.txt }
+  pmrep objectimport -i (Join-Path $PWD $xml) -c (Join-Path $PWD $ctrl) -l (Join-Path $PWD ('restore_' + ($xml -replace '[\\/]', '_') + '.log'))
+  if ($LASTEXITCODE -ne 0) { "FEHLER: $xml" }
 }
 ```
-
-**Nur einen Folder:** dieselbe Schleife ueber `grep '^DWH|' import_order.txt` bzw.
-`Get-Content .\import_order.txt | Where-Object { $_ -like 'DWH|*' }`. Shared Folder vorher wiederherstellen,
-falls deren Objekte im Ziel fehlen.
-
-**Einzelnes Objekt:** die Datei direkt importieren - mit `DEPS=full` bringt sie alle Abhaengigkeiten mit:
-
-```bash
-pmrep objectimport -i DWH/06_mapping/m_load_sales.xml -c DWH/import_ctrl.xml -l restore_m_load_sales.log
-```
-
-**Danach:** Import-Logs auf `renamed`/`error` pruefen, Workflows validieren, einen Testlauf starten.
-
-> Ein Backup ist erst ein Backup, wenn der Restore geprobt wurde: den Restore regelmaessig in ein
-> Sandbox-Repository durchspielen.
 
 ## Pruefen eines Backups
 
