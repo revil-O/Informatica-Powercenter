@@ -49,6 +49,12 @@ Ablage und Betrieb:
   --zip               jeden Folder nach erfolgreicher Pruefung als .tar.gz packen
   --list              Trockenlauf: nur Folder und Objektanzahl auflisten, nichts exportieren
   -h | --help         diese Hilfe
+
+Versionierung mit Git (optional):
+  --git VERZ          Exporte zusaetzlich in dieses Git-Repository uebernehmen und committen
+                      (wird bei Bedarf angelegt; Zeitstempel im XML-Kopf werden neutralisiert)
+  --git-author "Name <mail>"  Autor der Commits (Standard: git-Konfiguration)
+  --git-push          nach dem Commit pushen (Remote muss eingerichtet sein)
 EOF
 }
 
@@ -58,6 +64,7 @@ FOLDERS=""; SHARED=""; EXCLUDE=""; MODE="objects"; DEPS="full"
 TYPES="source,target,User Defined Function,transformation,mapplet,mapping,sessionconfig,session,worklet,workflow"
 BASEDIR="./infa_backup"; RETRIES=2; KEEP=0; MIN_FREE_MB=500; MAX_ERRORS=0
 FAIL_FAST=0; PARTIAL_OK=0; ZIP=0; LIST_ONLY=0; CONFIG=""
+GIT_REPO=""; GIT_AUTHOR=""; GIT_PUSH=0
 
 # Konfigurationsdatei: nur bekannte Schluessel, kein eval
 load_config() {
@@ -67,7 +74,7 @@ load_config() {
     key=$(printf '%s' "$key" | tr -d ' \t\r'); val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\r$//')
     case "$key" in
       ''|\#*) continue ;;
-      REPO|DOMAIN|SECDOMAIN|PASSVAR|PMREP|FOLDERS|SHARED|EXCLUDE|MODE|DEPS|TYPES|BASEDIR|RETRIES|KEEP|MIN_FREE_MB|MAX_ERRORS|FAIL_FAST|PARTIAL_OK|ZIP)
+      REPO|DOMAIN|SECDOMAIN|PASSVAR|PMREP|FOLDERS|SHARED|EXCLUDE|MODE|DEPS|TYPES|BASEDIR|RETRIES|KEEP|MIN_FREE_MB|MAX_ERRORS|FAIL_FAST|PARTIAL_OK|ZIP|GIT_REPO|GIT_AUTHOR|GIT_PUSH)
         printf -v "$key" '%s' "$val" ;;
       USER) REPUSER="$val" ;;
       *) echo "[WARNUNG] - unbekannter Schluessel in $1: $key" ;;
@@ -105,6 +112,9 @@ while [ $# -gt 0 ]; do
     --fail-fast) FAIL_FAST=1; shift ;;
     --partial-ok) PARTIAL_OK=1; shift ;;
     --zip) ZIP=1; shift ;;
+    --git) GIT_REPO="$2"; shift 2 ;;
+    --git-author) GIT_AUTHOR="$2"; shift 2 ;;
+    --git-push) GIT_PUSH=1; shift ;;
     --list) LIST_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[FEHLER] - unbekannte Option: $1"; usage; exit 2 ;;
@@ -115,7 +125,7 @@ fatal_usage() { echo "[FEHLER] - $1"; exit 2; }
 [ -n "$REPO" ] && [ -n "$DOMAIN" ] && [ -n "$REPUSER" ] || { usage; exit 2; }
 case "$MODE" in objects|workflows) ;; *) fatal_usage "Modus muss objects oder workflows sein" ;; esac
 case "$DEPS" in full|none) ;; *) fatal_usage "--deps muss full oder none sein" ;; esac
-for n in RETRIES KEEP MIN_FREE_MB MAX_ERRORS FAIL_FAST PARTIAL_OK ZIP; do
+for n in RETRIES KEEP MIN_FREE_MB MAX_ERRORS FAIL_FAST PARTIAL_OK ZIP GIT_PUSH; do
   [[ "${!n}" =~ ^[0-9]+$ ]] || fatal_usage "$n muss eine Zahl sein: ${!n}"
 done
 [ "$MODE" = "workflows" ] && { TYPES="workflow"; DEPS="full"; }
@@ -298,6 +308,93 @@ record_error() {  # $1=text
 
 DEPFLAGS=(); [ "$DEPS" = "full" ] && DEPFLAGS=(-m -s -b -r)
 
+### ---------------------------------------------------------------- Git-Versionierung
+# Ablage im Git-Repository: <GIT_REPO>/<REPO>/<folder>/<NN_typ>/<objekt>.xml (ohne Zeitstempel)
+GIT_BASE=""
+declare -A LIST_FAILED=()
+git_run() {  # git mit optionalem Autor
+  if [ -n "$GIT_AUTHOR" ]; then
+    local name="${GIT_AUTHOR%%<*}" mail="${GIT_AUTHOR#*<}"
+    name="${name%"${name##*[![:space:]]}"}"; mail="${mail%>*}"
+    git -C "$GIT_REPO" -c user.name="$name" -c user.email="$mail" "$@"
+  else
+    git -C "$GIT_REPO" "$@"
+  fi
+}
+
+git_prepare() {
+  command -v git >/dev/null 2>&1 || { record_error "Git: git nicht gefunden - Versionierung deaktiviert"; GIT_REPO=""; return 1; }
+  mkdir -p "$GIT_REPO" || { record_error "Git: Verzeichnis $GIT_REPO nicht anlegbar"; GIT_REPO=""; return 1; }
+  GIT_REPO=$(cd "$GIT_REPO" && pwd)
+  if [ ! -d "$GIT_REPO/.git" ]; then
+    git -C "$GIT_REPO" init -q > "$RUNDIR/log/git.txt" 2>&1 || { record_error "Git: init fehlgeschlagen, siehe log/git.txt"; GIT_REPO=""; return 1; }
+    printf '# Informatica-Exporte: keine Zeilenende-Konvertierung, Diff als Text\n*.xml -text diff\n' > "$GIT_REPO/.gitattributes"
+    log "[GIT] - neues Repository angelegt: $GIT_REPO"
+  elif [ -n "$(git -C "$GIT_REPO" status --porcelain 2>/dev/null)" ]; then
+    warn "Git: Arbeitsverzeichnis $GIT_REPO hat uncommittete Aenderungen - sie werden mit committet"
+  fi
+  GIT_BASE="$GIT_REPO/$(safe "$REPO")"
+  mkdir -p "$GIT_BASE"
+}
+
+# XML ohne wechselnden Zeitstempel (CREATION_DATE im POWERMART-Kopf) ins Git-Verzeichnis kopieren
+git_copy() {  # $1=quelle $2=ziel
+  mkdir -p "$(dirname "$2")"
+  LC_ALL=C sed 's|\(<POWERMART[^>]*CREATION_DATE *= *"\)[^"]*"|\101/01/1970 00:00:00"|' "$1" > "$2"
+}
+
+# einen Folder ins Git-Verzeichnis spiegeln; fehlgeschlagene Exporte behalten ihre letzte Version
+git_sync_folder() {  # $1=folder
+  local sf g rel p
+  sf=$(safe "$1"); g="$GIT_BASE/$sf"
+  local okl="$RUNDIR/log/git_ok_$sf.txt" keep="$RUNDIR/log/git_keep_$sf.txt"
+  awk -F';' -v f="$1" '$1==f && $7=="OK" {print $4}' "$MANIFEST" > "$okl"
+  awk -F';' -v f="$1" '$1==f && $7=="FEHLER" {sub(/\.failed$/,"",$4); print $4}' "$MANIFEST" > "$keep"
+  mkdir -p "$g"
+  while IFS= read -r rel; do git_copy "$RUNDIR/$rel" "$GIT_BASE/$rel"; done < "$okl"
+  [ -f "$RUNDIR/$sf/import_ctrl.xml" ] && cp "$RUNDIR/$sf/import_ctrl.xml" "$g/import_ctrl.xml"
+  # nicht mehr vorhandene Objekte entfernen - nur wenn alle Objektlisten des Folders lesbar waren
+  if [ -n "${LIST_FAILED[$1]:-}" ]; then
+    warn "Git: $1 - Objektliste unvollstaendig, geloeschte Objekte werden nicht entfernt"
+    return 0
+  fi
+  [ -d "$g" ] || return 0
+  find "$g" -type f -name '*.xml' ! -name import_ctrl.xml | while IFS= read -r p; do
+    rel="${p#"$GIT_BASE"/}"
+    grep -qxF "$rel" "$okl" || grep -qxF "$rel" "$keep" || rm -f "$p"
+  done
+  find "$g" -mindepth 1 -type d -empty -delete 2>/dev/null
+}
+
+git_commit() {  # $1=status
+  local stat add mod del
+  # Folder, die es im Repository nicht mehr gibt (nur bei Sicherung aller Folder)
+  if [ -z "$FOLDERS" ] && [ ${#ORDERED[@]} -gt 0 ]; then
+    local d name keep_it f
+    for d in "$GIT_BASE"/*/; do
+      [ -d "$d" ] || continue
+      name=$(basename "$d"); keep_it=0
+      for f in "${ORDERED[@]}"; do [ "$(safe "$f")" = "$name" ] && keep_it=1; done
+      [ -n "$EXCLUDE" ] && printf '%s\n' "$name" | grep -qE "$EXCLUDE" && keep_it=1
+      [ $keep_it -eq 0 ] && { rm -rf "$d"; log "[GIT] - Folder $name existiert nicht mehr - aus Git entfernt"; }
+    done
+  fi
+  git_run add -A -- . > "$RUNDIR/log/git.txt" 2>&1 || { record_error "Git: add fehlgeschlagen, siehe log/git.txt"; return 1; }
+  stat=$(git -C "$GIT_REPO" diff --cached --no-renames --name-status 2>/dev/null)
+  if [ -z "$stat" ]; then log "[GIT] - keine Aenderungen gegenueber dem letzten Backup"; return 0; fi
+  add=$(printf '%s\n' "$stat" | grep -c '^A'); mod=$(printf '%s\n' "$stat" | grep -c '^M'); del=$(printf '%s\n' "$stat" | grep -c '^D')
+  if ! git_run commit -q -m "Backup $REPO $STAMP ($1): $add neu, $mod geaendert, $del geloescht" \
+         -m "Lauf: $(basename "$RUNDIR")" >> "$RUNDIR/log/git.txt" 2>&1; then
+    record_error "Git: commit fehlgeschlagen (Autor konfiguriert? --git-author), siehe log/git.txt"; return 1
+  fi
+  log "[GIT] - Commit $(git -C "$GIT_REPO" rev-parse --short HEAD): $add neu, $mod geaendert, $del geloescht"
+  printf '%s\n' "$stat" > "$RUNDIR/git_changes.txt"
+  if [ "$GIT_PUSH" -eq 1 ]; then
+    if git -C "$GIT_REPO" push -q >> "$RUNDIR/log/git.txt" 2>&1; then log "[GIT] - gepusht"
+    else record_error "Git: push fehlgeschlagen, siehe log/git.txt"; fi
+  fi
+}
+
 ### ---------------------------------------------------------------- Start
 log "[FOLDER_BACKUP] - Repository=$REPO Modus=$MODE Abhaengigkeiten=$DEPS Ziel=$RUNDIR"
 [ $LIST_ONLY -eq 1 ] && log "[INFO] - Trockenlauf (--list): es wird nichts exportiert"
@@ -318,6 +415,7 @@ if ! connect; then
 fi
 log "[STATUS] - verbunden mit $REPO"
 check_space || { finish FAILED; exit 2; }
+[ -n "$GIT_REPO" ] && [ $LIST_ONLY -eq 0 ] && git_prepare
 
 ### ---------------------------------------------------------------- Folder ermitteln und ordnen
 ALL_FOLDERS=$(list_folders) || { log "[FEHLER] - Folderliste nicht lesbar, siehe log/list_folders.txt"; finish FAILED; exit 2; }
@@ -388,7 +486,7 @@ for f in "${ORDERED[@]}"; do
 
   for t in "${TYPELIST[@]}"; do
     t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
-    OBJS=$(list_objects "$t" "$f") || { record_error "$f: listobjects fuer Typ $t fehlgeschlagen"; continue; }
+    OBJS=$(list_objects "$t" "$f") || { LIST_FAILED[$f]=1; record_error "$f: listobjects fuer Typ $t fehlgeschlagen"; continue; }
     [ -z "$OBJS" ] && continue
     TDIR="$FDIR/$(type_index "$t")_$(safe "$(printf '%s' "$t" | tr 'A-Z ' 'a-z_')")"; mkdir -p "$TDIR"
     while IFS='|' read -r NAME SUB; do
@@ -452,6 +550,9 @@ for f in "${ORDERED[@]}"; do
     echo '</IMPORTPARAMS>'
   } > "$FDIR/import_ctrl.xml"
 
+  # ins Git-Verzeichnis spiegeln (vor dem Packen)
+  [ -n "$GIT_BASE" ] && git_sync_folder "$f"
+
   # optional packen (nur wenn der Folder fehlerfrei war)
   if [ "$ZIP" -eq 1 ] && [ $ERRORS -eq $f_err ]; then
     if tar czf "$FDIR.tar.gz" -C "$RUNDIR" "$(basename "$FDIR")" && tar tzf "$FDIR.tar.gz" >/dev/null 2>&1; then
@@ -478,6 +579,10 @@ fi
 
 ### ---------------------------------------------------------------- Abschluss
 if [ $ERRORS -eq 0 ]; then RESULT=SUCCESS; else RESULT=PARTIAL; fi
+if [ -n "$GIT_BASE" ]; then
+  git_commit "$RESULT"
+  if [ $ERRORS -eq 0 ]; then RESULT=SUCCESS; else RESULT=PARTIAL; fi
+fi
 log "[ERGEBNIS] - $RESULT: $N_OK von $N_OBJ Objekten gesichert, $ERRORS Fehler, $WARNINGS Warnungen"
 log "[ERGEBNIS] - Manifest: $MANIFEST"
 log "[ERGEBNIS] - Import-Reihenfolge: $ORDER"

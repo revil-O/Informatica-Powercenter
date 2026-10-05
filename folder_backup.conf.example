@@ -36,3 +36,9 @@ FAIL_FAST=0
 PARTIAL_OK=0
 # 1 = jeden fehlerfreien Folder packen (.tar.gz unter Linux, .zip unter Windows)
 ZIP=0
+
+# --- Versionierung mit Git (optional, siehe docs/FOLDER_BACKUP.md)
+# leer = aus; sonst Pfad zum Git-Repository (wird beim ersten Lauf angelegt)
+GIT_REPO=
+#GIT_AUTHOR=Informatica Backup <infa-backup@firma.de>
+GIT_PUSH=0

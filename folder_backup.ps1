@@ -17,6 +17,11 @@
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File folder_backup.ps1 -ConfigFile D:\infa\folder_backup.conf
+
+.EXAMPLE
+  .\folder_backup.ps1 -ConfigFile .\folder_backup.conf -GitRepo D:\infa_git -GitAuthor "Backup Job <backup@firma.de>"
+
+  Exporte zusaetzlich in ein Git-Repository uebernehmen (Zeitstempel im XML-Kopf neutralisiert) und committen.
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +46,10 @@ param(
   [switch]$FailFast,
   [switch]$PartialOk,
   [switch]$Zip,
-  [switch]$List
+  [switch]$List,
+  [string]$GitRepo,                           # Exporte zusaetzlich in dieses Git-Repository uebernehmen
+  [string]$GitAuthor,                         # "Name <mail>" fuer die Commits
+  [switch]$GitPush
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +61,8 @@ if ($ConfigFile) {
   $map = @{ REPO = 'Repository'; DOMAIN = 'Domain'; USER = 'User'; SECDOMAIN = 'SecurityDomain'; PASSVAR = 'PasswordVar'
             PMREP = 'Pmrep'; FOLDERS = 'Folders'; SHARED = 'SharedFolders'; EXCLUDE = 'Exclude'; TYPES = 'Types'
             MODE = 'Mode'; DEPS = 'Deps'; BASEDIR = 'BackupDir'; RETRIES = 'Retries'; KEEP = 'Keep'
-            MIN_FREE_MB = 'MinFreeMB'; MAX_ERRORS = 'MaxErrors'; FAIL_FAST = 'FailFast'; PARTIAL_OK = 'PartialOk'; ZIP = 'Zip' }
+            MIN_FREE_MB = 'MinFreeMB'; MAX_ERRORS = 'MaxErrors'; FAIL_FAST = 'FailFast'; PARTIAL_OK = 'PartialOk'; ZIP = 'Zip'
+            GIT_REPO = 'GitRepo'; GIT_AUTHOR = 'GitAuthor'; GIT_PUSH = 'GitPush' }
   foreach ($line in Get-Content $ConfigFile) {
     if ($line -match '^\s*(#|$)') { continue }
     if ($line -notmatch '^\s*([A-Z_]+)\s*=\s*(.*?)\s*$') { continue }
@@ -64,7 +73,7 @@ if ($ConfigFile) {
     switch ($p) {
       { $_ -in 'Folders', 'SharedFolders', 'Types' } { Set-Variable -Name $p -Value @($v -split ','); break }
       { $_ -in 'Retries', 'Keep', 'MinFreeMB', 'MaxErrors' } { Set-Variable -Name $p -Value ([int]$v); break }
-      { $_ -in 'FailFast', 'PartialOk', 'Zip' } { Set-Variable -Name $p -Value ([bool][int]$v); break }
+      { $_ -in 'FailFast', 'PartialOk', 'Zip', 'GitPush' } { Set-Variable -Name $p -Value ([bool][int]$v); break }
       default { Set-Variable -Name $p -Value $v }
     }
   }
@@ -253,6 +262,95 @@ function Add-Error([string]$Text) {
 
 function ConvertTo-XmlAttr([string]$s) { return [Security.SecurityElement]::Escape($s) }
 
+### ---------------------------------------------------------------- Git-Versionierung
+# Ablage: <GitRepo>/<Repository>/<folder>/<NN_typ>/<objekt>.xml (ohne Zeitstempel)
+$script:GitBase = $null
+$listFailed = @{}
+$Latin1 = [Text.Encoding]::GetEncoding(28591)   # byte-genau lesen/schreiben (Exporte sind Windows-1252)
+
+function Invoke-Git([string[]]$GitArgs, [string]$OutFile) {
+  $ErrorActionPreference = 'Continue'
+  $pre = @('-C', $GitRepo)
+  if ($GitAuthor -and $GitAuthor -match '^\s*(.*?)\s*<([^>]+)>') { $pre += @('-c', "user.name=$($Matches[1])", '-c', "user.email=$($Matches[2])") }
+  $out = & git @pre @GitArgs 2>&1
+  $rc = $LASTEXITCODE
+  if ($OutFile) { Add-Content -Path $OutFile -Value @($out | ForEach-Object { "$_" }) }
+  return [pscustomobject]@{ Rc = $rc; Out = @($out | ForEach-Object { "$_" }) }
+}
+
+function Initialize-Git {
+  if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Add-Error 'Git: git nicht gefunden - Versionierung deaktiviert'; return }
+  New-Item -ItemType Directory -Force -Path $GitRepo | Out-Null
+  $script:GitRepo = (Resolve-Path $GitRepo).Path
+  $gl = Join-Path $LogDir 'git.txt'
+  if (-not (Test-Path (Join-Path $GitRepo '.git'))) {
+    if ((Invoke-Git @('init', '-q') $gl).Rc -ne 0) { Add-Error 'Git: init fehlgeschlagen, siehe log\git.txt'; return }
+    [IO.File]::WriteAllText((Join-Path $GitRepo '.gitattributes'), "# Informatica-Exporte: keine Zeilenende-Konvertierung, Diff als Text`n*.xml -text diff`n", $Utf8NoBom)
+    Write-Log "[GIT] - neues Repository angelegt: $GitRepo"
+  } elseif ((Invoke-Git @('status', '--porcelain') $null).Out.Count -gt 0) {
+    Write-Warn "Git: Arbeitsverzeichnis $GitRepo hat uncommittete Aenderungen - sie werden mit committet"
+  }
+  $script:GitBase = Join-Path $GitRepo (Get-SafeName $Repository)
+  New-Item -ItemType Directory -Force -Path $script:GitBase | Out-Null
+}
+
+# XML ohne wechselnden Zeitstempel (CREATION_DATE im POWERMART-Kopf) kopieren
+function Copy-GitXml([string]$Src, [string]$Dst) {
+  New-Item -ItemType Directory -Force -Path (Split-Path $Dst) | Out-Null
+  $t = [IO.File]::ReadAllText($Src, $Latin1)
+  $t = [regex]::Replace($t, '(<POWERMART[^>]*CREATION_DATE *= *")[^"]*"', '${1}01/01/1970 00:00:00"', 'None', [TimeSpan]::FromSeconds(10))
+  [IO.File]::WriteAllText($Dst, $t, $Latin1)
+}
+
+# einen Folder spiegeln; fehlgeschlagene Exporte behalten ihre letzte Version
+function Sync-GitFolder([string]$Folder) {
+  $sf = Get-SafeName $Folder; $g = Join-Path $script:GitBase $sf
+  New-Item -ItemType Directory -Force -Path $g | Out-Null
+  $ok = @{}; $keep = @{}
+  foreach ($row in $manifestRows) {
+    $c = $row -split ';'
+    if ($c.Count -lt 7 -or $c[0] -cne $Folder) { continue }
+    $rel = $c[3] -replace '\\', '/'
+    if ($c[6] -eq 'OK') { $ok[$rel] = $true } elseif ($c[6] -eq 'FEHLER') { $keep[($rel -replace '\.failed$', '')] = $true }
+  }
+  foreach ($rel in $ok.Keys) { Copy-GitXml (Join-Path $RunDir $rel) (Join-Path $script:GitBase $rel) }
+  $ctrl = Join-Path (Join-Path $RunDir $sf) 'import_ctrl.xml'
+  if (Test-Path $ctrl) { Copy-Item $ctrl (Join-Path $g 'import_ctrl.xml') -Force }
+  if ($listFailed.ContainsKey($Folder)) { Write-Warn "Git: $Folder - Objektliste unvollstaendig, geloeschte Objekte werden nicht entfernt"; return }
+  foreach ($x in Get-ChildItem -Path $g -Recurse -Filter '*.xml' -File | Where-Object Name -ne 'import_ctrl.xml') {
+    $rel = $x.FullName.Substring($script:GitBase.Length + 1) -replace '\\', '/'
+    if (-not $ok.ContainsKey($rel) -and -not $keep.ContainsKey($rel)) { Remove-Item $x.FullName -Force }
+  }
+  Get-ChildItem -Path $g -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending |
+    Where-Object { -not (Get-ChildItem $_.FullName -Force) } | Remove-Item -Force
+}
+
+function Save-GitCommit([string]$State, [string[]]$Ordered) {
+  $gl = Join-Path $LogDir 'git.txt'
+  if ($Folders.Count -eq 0 -and $Ordered.Count -gt 0) {   # Folder, die es nicht mehr gibt
+    $names = @($Ordered | ForEach-Object { Get-SafeName $_ })
+    foreach ($d in Get-ChildItem -Path $script:GitBase -Directory) {
+      if ($names -ccontains $d.Name) { continue }
+      if ($Exclude -and $d.Name -match $Exclude) { continue }
+      Remove-Item $d.FullName -Recurse -Force; Write-Log "[GIT] - Folder $($d.Name) existiert nicht mehr - aus Git entfernt"
+    }
+  }
+  if ((Invoke-Git @('add', '-A', '--', '.') $gl).Rc -ne 0) { Add-Error 'Git: add fehlgeschlagen, siehe log\git.txt'; return }
+  $stat = (Invoke-Git @('diff', '--cached', '--no-renames', '--name-status') $null).Out | Where-Object { $_ }
+  if (-not $stat) { Write-Log '[GIT] - keine Aenderungen gegenueber dem letzten Backup'; return }
+  $add = @($stat | Where-Object { $_ -like 'A*' }).Count; $mod = @($stat | Where-Object { $_ -like 'M*' }).Count; $del = @($stat | Where-Object { $_ -like 'D*' }).Count
+  $msg = "Backup $Repository $Stamp ($State): $add neu, $mod geaendert, $del geloescht"
+  if ((Invoke-Git @('commit', '-q', '-m', $msg, '-m', "Lauf: $(Split-Path $RunDir -Leaf)") $gl).Rc -ne 0) {
+    Add-Error 'Git: commit fehlgeschlagen (Autor konfiguriert? -GitAuthor), siehe log\git.txt'; return
+  }
+  $head = ((Invoke-Git @('rev-parse', '--short', 'HEAD') $null).Out | Select-Object -First 1)
+  Write-Log "[GIT] - Commit ${head}: $add neu, $mod geaendert, $del geloescht"
+  [IO.File]::WriteAllLines((Join-Path $RunDir 'git_changes.txt'), [string[]]$stat, $Utf8NoBom)
+  if ($GitPush) {
+    if ((Invoke-Git @('push', '-q') $gl).Rc -eq 0) { Write-Log '[GIT] - gepusht' } else { Add-Error 'Git: push fehlgeschlagen, siehe log\git.txt' }
+  }
+}
+
 ### ---------------------------------------------------------------- Hauptteil
 $exitCode = 2
 try {
@@ -279,6 +377,7 @@ try {
   }
   Write-Log "[STATUS] - verbunden mit $Repository"
   if (-not (Test-Space)) { Complete-Run 'FAILED'; exit 2 }
+  if ($GitRepo -and -not $List) { Initialize-Git }
 
   ### ------------------------------------------------------------ Folder ermitteln und ordnen
   $allFolders = Get-Folders
@@ -320,7 +419,7 @@ try {
       Write-Log "[LISTE] - $line"
     }
     Complete-Run 'SUCCESS'; $exitCode = 0
-    return
+    exit 0
   }
 
   ### ------------------------------------------------------------ Backup je Folder
@@ -335,7 +434,7 @@ try {
 
     foreach ($t in $Types) {
       $objs = Get-FolderObjects $t $f
-      if ($null -eq $objs) { Add-Error "${f}: listobjects fuer Typ $t fehlgeschlagen"; continue }
+      if ($null -eq $objs) { $listFailed[$f] = $true; Add-Error "${f}: listobjects fuer Typ $t fehlgeschlagen"; continue }
       if ($objs.Count -eq 0) { continue }
       $tdir = Join-Path $fdir ('{0}_{1}' -f (Get-TypeIndex $t), (Get-SafeName ($t.ToLower() -replace ' ', '_')))
       New-Item -ItemType Directory -Force -Path $tdir | Out-Null
@@ -404,6 +503,9 @@ try {
     $cx += @('    <TYPEOBJECT OBJECTTYPENAME="All" RESOLUTION="REPLACE"/>', '  </RESOLVECONFLICT>', '</IMPORTPARAMS>')
     [IO.File]::WriteAllLines((Join-Path $fdir 'import_ctrl.xml'), [string[]]$cx, $Utf8NoBom)
 
+    # ins Git-Verzeichnis spiegeln (vor dem Packen)
+    if ($script:GitBase) { Sync-GitFolder $f }
+
     # optional packen (nur wenn der Folder fehlerfrei war)
     if ($Zip -and $script:Errors -eq $fErr) {
       $zipFile = "$fdir.zip"
@@ -430,6 +532,10 @@ try {
 
   ### ------------------------------------------------------------ Abschluss
   $result = 'SUCCESS'; if ($script:Errors -gt 0) { $result = 'PARTIAL' }
+  if ($script:GitBase) {
+    Save-GitCommit $result $ordered
+    $result = 'SUCCESS'; if ($script:Errors -gt 0) { $result = 'PARTIAL' }
+  }
   Write-Log ("[ERGEBNIS] - {0}: {1} von {2} Objekten gesichert, {3} Fehler, {4} Warnungen" -f $result, $script:NOk, $script:NObj, $script:Errors, $script:Warnings)
   Write-Log "[ERGEBNIS] - Manifest: $Manifest"
   Write-Log "[ERGEBNIS] - Import-Reihenfolge: $OrderFile"
