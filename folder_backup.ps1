@@ -22,6 +22,11 @@
   .\folder_backup.ps1 -ConfigFile .\folder_backup.conf -GitRepo D:\infa_git -GitAuthor "Backup Job <backup@firma.de>"
 
   Exporte zusaetzlich in ein Git-Repository uebernehmen (Zeitstempel im XML-Kopf neutralisiert) und committen.
+
+.EXAMPLE
+  .\folder_backup.ps1 -ConfigFile .\folder_backup.conf -Incremental Q_CHANGED_2D
+
+  Nur Objekte sichern, die die gespeicherte Repository-Query Q_CHANGED_2D liefert (eigener Lauf ..._inc).
 #>
 [CmdletBinding()]
 param(
@@ -49,7 +54,10 @@ param(
   [switch]$List,
   [string]$GitRepo,                           # Exporte zusaetzlich in dieses Git-Repository uebernehmen
   [string]$GitAuthor,                         # "Name <mail>" fuer die Commits
-  [switch]$GitPush
+  [switch]$GitPush,
+  [string]$Incremental,                       # gespeicherte Repository-Query: nur geaenderte Objekte sichern
+  [ValidateSet('shared', 'personal')][string]$QueryType = 'shared',
+  [switch]$NoExtras                           # keine ergaenzenden Sicherungen in _repository/
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,7 +70,8 @@ if ($ConfigFile) {
             PMREP = 'Pmrep'; FOLDERS = 'Folders'; SHARED = 'SharedFolders'; EXCLUDE = 'Exclude'; TYPES = 'Types'
             MODE = 'Mode'; DEPS = 'Deps'; BASEDIR = 'BackupDir'; RETRIES = 'Retries'; KEEP = 'Keep'
             MIN_FREE_MB = 'MinFreeMB'; MAX_ERRORS = 'MaxErrors'; FAIL_FAST = 'FailFast'; PARTIAL_OK = 'PartialOk'; ZIP = 'Zip'
-            GIT_REPO = 'GitRepo'; GIT_AUTHOR = 'GitAuthor'; GIT_PUSH = 'GitPush' }
+            GIT_REPO = 'GitRepo'; GIT_AUTHOR = 'GitAuthor'; GIT_PUSH = 'GitPush'
+            INCR_QUERY = 'Incremental'; QUERY_TYPE = 'QueryType'; EXTRAS = 'NoExtras' }
   foreach ($line in Get-Content $ConfigFile) {
     if ($line -match '^\s*(#|$)') { continue }
     if ($line -notmatch '^\s*([A-Z_]+)\s*=\s*(.*?)\s*$') { continue }
@@ -74,6 +83,7 @@ if ($ConfigFile) {
       { $_ -in 'Folders', 'SharedFolders', 'Types' } { Set-Variable -Name $p -Value @($v -split ','); break }
       { $_ -in 'Retries', 'Keep', 'MinFreeMB', 'MaxErrors' } { Set-Variable -Name $p -Value ([int]$v); break }
       { $_ -in 'FailFast', 'PartialOk', 'Zip', 'GitPush' } { Set-Variable -Name $p -Value ([bool][int]$v); break }
+      'NoExtras' { Set-Variable -Name $p -Value (-not [bool][int]$v); break }   # EXTRAS=0 -> -NoExtras
       default { Set-Variable -Name $p -Value $v }
     }
   }
@@ -121,6 +131,7 @@ function Get-SafeName([string]$Name) { return ($Name -replace '[^A-Za-z0-9_.-]',
 $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Prefix = (Get-SafeName $Repository) + '_'
 $RunDir = Join-Path $BackupDir ($Prefix + $Stamp)
+if ($Incremental) { $RunDir = "${RunDir}_inc" }
 if ($List) { $RunDir = Join-Path $BackupDir "list_$Stamp" }
 $n = 1; $baseRunDir = $RunDir
 while (Test-Path $RunDir) { $n++; $RunDir = "${baseRunDir}_$n" }
@@ -205,6 +216,7 @@ function Get-Folders {
 }
 
 $formatWarnings = New-Object System.Collections.Generic.List[string]
+$folderRows = New-Object System.Collections.Generic.List[string]
 # -> Objekte mit Name/Sub (nur wiederverwendbare); $null bei Fehler
 function Get-FolderObjects([string]$Type, [string]$FolderName) {
   $raw = Join-Path $LogDir ('list_{0}_{1}.txt' -f (Get-SafeName $FolderName), (Get-SafeName $Type))
@@ -315,7 +327,12 @@ function Sync-GitFolder([string]$Folder) {
   }
   foreach ($rel in $ok.Keys) { Copy-GitXml (Join-Path $RunDir $rel) (Join-Path $script:GitBase $rel) }
   $ctrl = Join-Path (Join-Path $RunDir $sf) 'import_ctrl.xml'
-  if (Test-Path $ctrl) { Copy-Item $ctrl (Join-Path $g 'import_ctrl.xml') -Force }
+  $gctrl = Join-Path $g 'import_ctrl.xml'
+  if (Test-Path $ctrl) {
+    if ($Incremental -and (Test-Path $gctrl)) { Merge-Ctrl $ctrl $gctrl }   # Shortcut-Eintraege ergaenzen statt ersetzen
+    else { Copy-Item $ctrl $gctrl -Force }
+  }
+  if ($Incremental) { return }   # inkrementell: nichts loeschen
   if ($listFailed.ContainsKey($Folder)) { Write-Warn "Git: $Folder - Objektliste unvollstaendig, geloeschte Objekte werden nicht entfernt"; return }
   foreach ($x in Get-ChildItem -Path $g -Recurse -Filter '*.xml' -File | Where-Object Name -ne 'import_ctrl.xml') {
     $rel = $x.FullName.Substring($script:GitBase.Length + 1) -replace '\\', '/'
@@ -325,11 +342,35 @@ function Sync-GitFolder([string]$Folder) {
     Where-Object { -not (Get-ChildItem $_.FullName -Force) } | Remove-Item -Force
 }
 
+# Control-Files zusammenfuehren: FOLDERMAP- und SPECIFICOBJECT-Zeilen aus $Add in $Base ergaenzen (Base wird ueberschrieben)
+function Merge-Ctrl([string]$Add, [string]$Base) {
+  $addL = @(Get-Content $Add); $baseL = @(Get-Content $Base)
+  $seen = @{}; foreach ($l in $baseL) { $seen[$l] = $true }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($l in $baseL) {
+    if ($l -match '<RESOLVECONFLICT>') { foreach ($x in $addL) { if ($x -match '<FOLDERMAP ' -and -not $seen.ContainsKey($x)) { $out.Add($x); $seen[$x] = $true } } }
+    if ($l -match '<TYPEOBJECT ') { foreach ($x in $addL) { if ($x -match '<SPECIFICOBJECT ' -and -not $seen.ContainsKey($x)) { $out.Add($x); $seen[$x] = $true } } }
+    $out.Add($l)
+  }
+  [IO.File]::WriteAllLines($Base, [string[]]$out, $Utf8NoBom)
+}
+
 function Save-GitCommit([string]$State, [string[]]$Ordered) {
   $gl = Join-Path $LogDir 'git.txt'
-  if ($Folders.Count -eq 0 -and $Ordered.Count -gt 0) {   # Folder, die es nicht mehr gibt
+  # ergaenzende Sicherungen (_repository) als Momentaufnahme spiegeln
+  $xr = Join-Path $RunDir '_repository'; $xg = Join-Path $script:GitBase '_repository'
+  if (Test-Path $xr) {
+    $keepF = $null; $gf = Join-Path $xg 'folders.csv'
+    # inkrementell enthaelt folders.csv nur die geaenderten Folder -> bisherige Fassung behalten
+    if ($Incremental -and (Test-Path $gf)) { $keepF = [IO.File]::ReadAllBytes($gf) }
+    if (Test-Path $xg) { Remove-Item $xg -Recurse -Force }
+    Copy-Item $xr $xg -Recurse
+    if ($keepF) { [IO.File]::WriteAllBytes($gf, $keepF) }
+  }
+  if ($Folders.Count -eq 0 -and -not $Incremental -and $Ordered.Count -gt 0) {   # Folder, die es nicht mehr gibt
     $names = @($Ordered | ForEach-Object { Get-SafeName $_ })
     foreach ($d in Get-ChildItem -Path $script:GitBase -Directory) {
+      if ($d.Name -eq '_repository') { continue }
       if ($names -ccontains $d.Name) { continue }
       if ($Exclude -and $d.Name -match $Exclude) { continue }
       Remove-Item $d.FullName -Recurse -Force; Write-Log "[GIT] - Folder $($d.Name) existiert nicht mehr - aus Git entfernt"
@@ -339,7 +380,8 @@ function Save-GitCommit([string]$State, [string[]]$Ordered) {
   $stat = (Invoke-Git @('diff', '--cached', '--no-renames', '--name-status') $null).Out | Where-Object { $_ }
   if (-not $stat) { Write-Log '[GIT] - keine Aenderungen gegenueber dem letzten Backup'; return }
   $add = @($stat | Where-Object { $_ -like 'A*' }).Count; $mod = @($stat | Where-Object { $_ -like 'M*' }).Count; $del = @($stat | Where-Object { $_ -like 'D*' }).Count
-  $msg = "Backup $Repository $Stamp ($State): $add neu, $mod geaendert, $del geloescht"
+  $kind = 'Backup'; if ($Incremental) { $kind = 'Inkrementell' }
+  $msg = "$kind $Repository $Stamp ($State): $add neu, $mod geaendert, $del geloescht"
   if ((Invoke-Git @('commit', '-q', '-m', $msg, '-m', "Lauf: $(Split-Path $RunDir -Leaf)") $gl).Rc -ne 0) {
     Add-Error 'Git: commit fehlgeschlagen (Autor konfiguriert? -GitAuthor), siehe log\git.txt'; return
   }
@@ -390,6 +432,43 @@ try {
   } else { foreach ($f in $allFolders) { $want.Add($f) } }
   if ($Exclude) { $want = [System.Collections.Generic.List[string]]@($want | Where-Object { $_ -notmatch $Exclude }) }
 
+  # Inkrementell: geaenderte Objekte aus der gespeicherten Query.
+  # Kandidaten (Zeile, Folder, Typ, Token) - der Objektname wird spaeter gegen listobjects abgeglichen
+  $cand = New-Object System.Collections.Generic.List[object]; $candFT = @{}; $matched = @{}
+  if ($Incremental) {
+    Set-Content -Path (Join-Path $RunDir 'INCREMENTAL') -Value "query=$Incremental"
+    $qOut = Join-Path $LogDir 'query_result.txt'; $qFile = Join-Path $LogDir 'query_persistent.txt'
+    if (-not (Invoke-Pmrep @('executequery', '-q', $Incremental, '-t', $QueryType, '-c', '|', '-u', $qFile) $qOut)) {
+      Write-Log "[FEHLER] - Query '$Incremental' ($QueryType) nicht ausfuehrbar, siehe log\query_result.txt"
+      Write-Log '[HINWEIS] - Query im Repository Manager anlegen (Tools > Queries), siehe docs/FOLDER_BACKUP.md'
+      Complete-Run 'FAILED'; exit 2
+    }
+    # Quelle: persistente Datei (Komma), sonst Bildschirmausgabe (|)
+    if ((Test-Path $qFile) -and (Get-Item $qFile).Length -gt 0) { $qSrc = $qFile; $qSep = ',' } else { $qSrc = $qOut; $qSep = '|' }
+    $known = @{}; foreach ($t in $Types) { $known[$t.ToLower()] = $true }
+    $folderSet = @{}; foreach ($f in $allFolders) { $folderSet[$f] = $true }
+    $ln = 0
+    foreach ($line in Get-Content $qSrc) {
+      $ln++
+      $tok = @($line -split [regex]::Escape($qSep) | ForEach-Object { $_.Trim() })
+      $ti = -1; for ($i = 0; $i -lt $tok.Count; $i++) { if ($known.ContainsKey($tok[$i].ToLower())) { $ti = $i; break } }
+      if ($ti -lt 0) { continue }
+      $t = $tok[$ti].ToLower(); $tok[$ti] = ''
+      $fi = -1; for ($i = 0; $i -lt $tok.Count; $i++) { if ($tok[$i] -and $folderSet.ContainsKey($tok[$i])) { $fi = $i; break } }
+      if ($fi -lt 0) { continue }
+      $f = $tok[$fi]; $tok[$fi] = ''
+      foreach ($v in $tok) {
+        if (-not $v -or $v -match '^[0-9]+$' -or $v -match '%3[Aa]|^[0-9]+:' -or $v -in 'reusable', 'non-reusable' -or $v -eq 'none') { continue }
+        $cand.Add([pscustomobject]@{ Line = $ln; Folder = $f; Type = $t; Token = $v }); $candFT["$f|$t"] = $true
+      }
+    }
+    $nq = @($cand | Select-Object -ExpandProperty Line -Unique).Count
+    Write-Log "[INKREMENTELL] - Query '$Incremental': $nq Objekt(e) in den gesicherten Typen"
+    $cand | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.Line, $_.Folder, $_.Type, $_.Token } | Set-Content (Join-Path $LogDir 'query_candidates.txt')
+    $want = [System.Collections.Generic.List[string]]@($want | Where-Object { $f = $_; @($candFT.Keys | Where-Object { $_.StartsWith("$f|") }).Count -gt 0 })
+    if ($want.Count -eq 0) { Write-Log '[INKREMENTELL] - keine geaenderten Objekte - nichts zu sichern' }
+  }
+
   $isShared = @{}
   if ($SharedFolders.Count -gt 0) {
     foreach ($f in $SharedFolders) { if ($want -ccontains $f) { $isShared[$f] = $true } else { Write-Warn "Shared Folder $f nicht im Backup-Umfang" } }
@@ -433,8 +512,18 @@ try {
     Write-Log "[FOLDER] - $f$tag"
 
     foreach ($t in $Types) {
+      if ($Incremental -and -not $candFT.ContainsKey("$f|$($t.ToLower())")) { continue }
       $objs = Get-FolderObjects $t $f
       if ($null -eq $objs) { $listFailed[$f] = $true; Add-Error "${f}: listobjects fuer Typ $t fehlgeschlagen"; continue }
+      if ($Incremental -and $objs.Count -gt 0) {
+        # nur geaenderte Objekte; Name voll (DBD.NAME) oder ohne DBD-Praefix
+        $mine = @($cand | Where-Object { $_.Folder -ceq $f -and $_.Type -eq $t.ToLower() })
+        $objs = @($objs | Where-Object {
+          $n = $_.Name; $s = $n; if ($t.ToLower() -eq 'source' -and $n.Contains('.')) { $s = $n.Substring($n.IndexOf('.') + 1) }
+          $hit = @($mine | Where-Object { $_.Token -ceq $n -or ($t.ToLower() -eq 'source' -and $_.Token -ceq $s) })
+          foreach ($h in $hit) { $matched[$h.Line] = $true }
+          $hit.Count -gt 0 })
+      }
       if ($objs.Count -eq 0) { continue }
       $tdir = Join-Path $fdir ('{0}_{1}' -f (Get-TypeIndex $t), (Get-SafeName ($t.ToLower() -replace ' ', '_')))
       New-Item -ItemType Directory -Force -Path $tdir | Out-Null
@@ -470,6 +559,13 @@ try {
 
     # Shared-Status aus den Exporten bestaetigen
     $first = Get-ChildItem -Path $fdir -Recurse -Filter '*.xml' -File | Select-Object -First 1
+    if (-not $NoExtras -and $first) {
+      $fm = [regex]::Match([IO.File]::ReadAllText($first.FullName), '<FOLDER\s[^>]*>')
+      if ($fm.Success) {
+        $fa = @{}; foreach ($am in [regex]::Matches($fm.Value, '([A-Za-z_]+)\s*=\s*"([^"]*)"')) { $fa[$am.Groups[1].Value] = $am.Groups[2].Value }
+        $folderRows.Add(('{0};{1};{2};{3};{4};{5}' -f $f, $fa['SHARED'], $fa['OWNER'], $fa['GROUP'], $fa['PERMISSIONS'], ("$($fa['DESCRIPTION'])" -replace ';', ',')))
+      }
+    }
     if ($first -and -not $isShared.ContainsKey($f) -and (Select-String -Path $first.FullName -Pattern '<FOLDER [^>]*SHARED *= *"SHARED"' -Quiet)) {
       Write-Warn "$f ist ein Shared Folder, wurde aber nicht zuerst gesichert - im Restore zuerst importieren (-SharedFolders angeben)"
       $isShared[$f] = $true
@@ -528,6 +624,47 @@ try {
     }
   }
   [IO.File]::WriteAllLines($OrderFile, [string[]]$orderLines, $Utf8NoBom)
+  # Inkrementell: Query-Treffer ohne passendes wiederverwendbares Objekt
+  if ($Incremental -and $cand.Count -gt 0) {
+    $unm = @($cand | Select-Object -ExpandProperty Line -Unique | Where-Object { -not $matched.ContainsKey($_) }).Count
+    if ($unm -gt 0) { Write-Log "[INKREMENTELL] - $unm Query-Treffer ohne passendes wiederverwendbares Objekt (nicht wiederverwendbar, geloescht oder ausserhalb des Umfangs), siehe log\query_candidates.txt" }
+  }
+
+  # ergaenzende Sicherungen: Connections (ohne Passwoerter), Folder, ausgecheckte Objekte, globale Objekte
+  if (-not $NoExtras) {
+    $x = Join-Path $RunDir '_repository'; $xc = Join-Path $x 'connections'
+    New-Item -ItemType Directory -Force -Path $xc | Out-Null
+    $cl = Join-Path $x 'connections.txt'
+    if (Invoke-Pmrep @('listconnections', '-t') $cl) {
+      foreach ($line in Get-Content $cl) {
+        if (Test-Noise $line.Trim()) { continue }
+        $parts = @($line -split '[,|\s]+' | Where-Object { $_ })
+        if ($parts.Count -eq 0) { continue }
+        $name = $parts[0]
+        $typ = $parts | Where-Object { $_ -match '^(relational|application|ftp|loader|queue)$' } | Select-Object -First 1
+        if (-not $typ) { $typ = 'relational' }
+        $tmp = Join-Path $xc ((Get-SafeName $name) + '.tmp')
+        if (Invoke-Pmrep @('getconnectiondetails', '-n', $name, '-t', $typ) $tmp) {
+          Get-Content $tmp | Where-Object { $_ -notmatch 'password|passwort' } | Set-Content (Join-Path $xc ((Get-SafeName $name) + '.txt'))
+        } else { Write-Warn "Extras: Details fuer Connection $name nicht lesbar" }
+        Remove-Item $tmp -ErrorAction SilentlyContinue
+      }
+      $clean = @(Get-Content $cl | Where-Object { $_ -notmatch 'password|passwort' }); [IO.File]::WriteAllLines($cl, [string[]]$clean, $Utf8NoBom)
+    } else { Write-Warn 'Extras: listconnections fehlgeschlagen, siehe _repository\connections.txt' }
+    if ($folderRows.Count -gt 0) {
+      [IO.File]::WriteAllLines((Join-Path $x 'folders.csv'), [string[]](@('folder;shared;owner;group;permissions;beschreibung') + $folderRows), $Utf8NoBom)
+    }
+    $co = Join-Path $x 'checkouts.txt'
+    if (Invoke-Pmrep @('findcheckout', '-u', '-c', '|') $co) {
+      $nco = @(Get-Content $co | Where-Object { -not (Test-Noise $_.Trim()) }).Count
+      if ($nco -gt 0) { Write-Warn "$nco ausgecheckte(s) Objekt(e) - das Backup enthaelt die zuletzt eingecheckte Version, siehe _repository\checkouts.txt" }
+    } else { Write-Log '[INFO] - findcheckout nicht verfuegbar (nicht versioniertes Repository?) - siehe _repository\checkouts.txt' }
+    foreach ($o in @(@('label', 'labels'), @('deploymentgroup', 'deploymentgroups'), @('query', 'queries'))) {
+      if (-not (Invoke-Pmrep @('listobjects', '-o', $o[0]) (Join-Path $x "$($o[1]).txt"))) { Write-Log "[INFO] - listobjects -o $($o[0]) nicht verfuegbar" }
+    }
+    Write-Log '[EXTRAS] - Connections, Folder-Eigenschaften, Checkouts, Labels, Deployment Groups, Queries in _repository/'
+  }
+
   foreach ($w in $formatWarnings) { Write-Warn $w }
 
   ### ------------------------------------------------------------ Abschluss
@@ -540,11 +677,15 @@ try {
   Write-Log "[ERGEBNIS] - Manifest: $Manifest"
   Write-Log "[ERGEBNIS] - Import-Reihenfolge: $OrderFile"
   Complete-Run $result
-  if ($result -eq 'SUCCESS') { Set-Content -Path (Join-Path $BackupDir 'LATEST_SUCCESS') -Value (Split-Path $RunDir -Leaf) }
+  if ($result -eq 'SUCCESS') {
+    $latest = 'LATEST_SUCCESS'; if ($Incremental) { $latest = 'LATEST_INCREMENTAL' }
+    Set-Content -Path (Join-Path $BackupDir $latest) -Value (Split-Path $RunDir -Leaf)
+  }
 
   # Aufbewahrung: nur nach Erfolg; alles aelter als das N-te erfolgreiche Backup loeschen
-  if ($result -eq 'SUCCESS' -and $Keep -gt 0) {
-    $good = @(Get-ChildItem -Path $BackupDir -Directory -Filter "$Prefix*" | Where-Object { Test-Path (Join-Path $_.FullName 'SUCCESS') } | Sort-Object Name -Descending)
+  if ($result -eq 'SUCCESS' -and $Keep -gt 0 -and -not $Incremental) {
+    # nur Vollsicherungen zaehlen (ohne Marker INCREMENTAL); aeltere inkrementelle Laeufe werden mit geloescht
+    $good = @(Get-ChildItem -Path $BackupDir -Directory -Filter "$Prefix*" | Where-Object { (Test-Path (Join-Path $_.FullName 'SUCCESS')) -and -not (Test-Path (Join-Path $_.FullName 'INCREMENTAL')) } | Sort-Object Name -Descending)
     if ($good.Count -ge $Keep) {
       $cut = $good[$Keep - 1].Name
       foreach ($d in Get-ChildItem -Path $BackupDir -Directory -Filter "$Prefix*") {

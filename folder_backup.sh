@@ -50,6 +50,16 @@ Ablage und Betrieb:
   --list              Trockenlauf: nur Folder und Objektanzahl auflisten, nichts exportieren
   -h | --help         diese Hilfe
 
+Inkrementell (optional):
+  --incremental QUERY nur Objekte sichern, die die gespeicherte Repository-Query QUERY liefert
+                      (z.B. "Last Saved Time within last 2 days", siehe docs/FOLDER_BACKUP.md);
+                      eigener Lauf <REPO>_<Zeitstempel>_inc, Aufbewahrung zaehlt nur Vollsicherungen
+  --query-type TYP    shared (Standard) oder personal
+
+Ergaenzende Sicherungen (Standard: an):
+  --no-extras         keine Connections, Folder-Eigenschaften, ausgecheckten Objekte, Labels,
+                      Deployment Groups, Queries in _repository/ sichern
+
 Versionierung mit Git (optional):
   --git VERZ          Exporte zusaetzlich in dieses Git-Repository uebernehmen und committen
                       (wird bei Bedarf angelegt; Zeitstempel im XML-Kopf werden neutralisiert)
@@ -65,6 +75,7 @@ TYPES="source,target,User Defined Function,transformation,mapplet,mapping,sessio
 BASEDIR="./infa_backup"; RETRIES=2; KEEP=0; MIN_FREE_MB=500; MAX_ERRORS=0
 FAIL_FAST=0; PARTIAL_OK=0; ZIP=0; LIST_ONLY=0; CONFIG=""
 GIT_REPO=""; GIT_AUTHOR=""; GIT_PUSH=0
+INCR_QUERY=""; QUERY_TYPE="shared"; EXTRAS=1
 
 # Konfigurationsdatei: nur bekannte Schluessel, kein eval
 load_config() {
@@ -74,7 +85,7 @@ load_config() {
     key=$(printf '%s' "$key" | tr -d ' \t\r'); val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/\r$//')
     case "$key" in
       ''|\#*) continue ;;
-      REPO|DOMAIN|SECDOMAIN|PASSVAR|PMREP|FOLDERS|SHARED|EXCLUDE|MODE|DEPS|TYPES|BASEDIR|RETRIES|KEEP|MIN_FREE_MB|MAX_ERRORS|FAIL_FAST|PARTIAL_OK|ZIP|GIT_REPO|GIT_AUTHOR|GIT_PUSH)
+      REPO|DOMAIN|SECDOMAIN|PASSVAR|PMREP|FOLDERS|SHARED|EXCLUDE|MODE|DEPS|TYPES|BASEDIR|RETRIES|KEEP|MIN_FREE_MB|MAX_ERRORS|FAIL_FAST|PARTIAL_OK|ZIP|GIT_REPO|GIT_AUTHOR|GIT_PUSH|INCR_QUERY|QUERY_TYPE|EXTRAS)
         printf -v "$key" '%s' "$val" ;;
       USER) REPUSER="$val" ;;
       *) echo "[WARNUNG] - unbekannter Schluessel in $1: $key" ;;
@@ -115,6 +126,9 @@ while [ $# -gt 0 ]; do
     --git) GIT_REPO="$2"; shift 2 ;;
     --git-author) GIT_AUTHOR="$2"; shift 2 ;;
     --git-push) GIT_PUSH=1; shift ;;
+    --incremental) INCR_QUERY="$2"; shift 2 ;;
+    --query-type) QUERY_TYPE="$2"; shift 2 ;;
+    --no-extras) EXTRAS=0; shift ;;
     --list) LIST_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[FEHLER] - unbekannte Option: $1"; usage; exit 2 ;;
@@ -125,7 +139,8 @@ fatal_usage() { echo "[FEHLER] - $1"; exit 2; }
 [ -n "$REPO" ] && [ -n "$DOMAIN" ] && [ -n "$REPUSER" ] || { usage; exit 2; }
 case "$MODE" in objects|workflows) ;; *) fatal_usage "Modus muss objects oder workflows sein" ;; esac
 case "$DEPS" in full|none) ;; *) fatal_usage "--deps muss full oder none sein" ;; esac
-for n in RETRIES KEEP MIN_FREE_MB MAX_ERRORS FAIL_FAST PARTIAL_OK ZIP GIT_PUSH; do
+case "$QUERY_TYPE" in shared|personal) ;; *) fatal_usage "--query-type muss shared oder personal sein" ;; esac
+for n in RETRIES KEEP MIN_FREE_MB MAX_ERRORS FAIL_FAST PARTIAL_OK ZIP GIT_PUSH EXTRAS; do
   [[ "${!n}" =~ ^[0-9]+$ ]] || fatal_usage "$n muss eine Zahl sein: ${!n}"
 done
 [ "$MODE" = "workflows" ] && { TYPES="workflow"; DEPS="full"; }
@@ -153,6 +168,7 @@ echo $$ > "$LOCK/pid"
 
 STAMP=$(date +%Y%m%d_%H%M%S)
 RUNDIR="$BASEDIR/$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9_.\n-' '_')_$STAMP"
+[ -n "$INCR_QUERY" ] && RUNDIR="${RUNDIR}_inc"
 [ $LIST_ONLY -eq 1 ] && RUNDIR="$BASEDIR/list_$STAMP"
 # eindeutig machen (zwei Laeufe in derselben Sekunde)
 n=1; BASE_RUNDIR="$RUNDIR"
@@ -169,6 +185,15 @@ log()  { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
 warn() { WARNINGS=$((WARNINGS+1)); log "[WARNUNG] - $*"; }
 safe() { printf '%s\n' "$1" | tr -c 'A-Za-z0-9_.\n-' '_'; }
 get_attr() { printf '%s\n' "$1" | sed -n "s/.*[[:space:]]$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p"; }
+# Control-Files zusammenfuehren: FOLDERMAP- und SPECIFICOBJECT-Zeilen aus $1 in $2 ergaenzen -> stdout
+merge_ctrl() {  # $1=zusatz $2=basis
+  awk 'NR==FNR { if ($0 ~ /<FOLDERMAP /) fm[++a]=$0; else if ($0 ~ /<SPECIFICOBJECT /) so[++b]=$0; next }
+       { base[++m]=$0; seen[$0]=1 }
+       END { for (i=1;i<=m;i++) { l=base[i]
+               if (l ~ /<RESOLVECONFLICT>/) for (j=1;j<=a;j++) if (!(fm[j] in seen)) { print fm[j]; seen[fm[j]]=1 }
+               if (l ~ /<TYPEOBJECT /)      for (j=1;j<=b;j++) if (!(so[j] in seen)) { print so[j]; seen[so[j]]=1 }
+               print l } }' "$1" "$2"
+}
 xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/"/\&quot;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 finish() {  # $1 = Status (SUCCESS|PARTIAL|FAILED)
@@ -352,8 +377,16 @@ git_sync_folder() {  # $1=folder
   awk -F';' -v f="$1" '$1==f && $7=="FEHLER" {sub(/\.failed$/,"",$4); print $4}' "$MANIFEST" > "$keep"
   mkdir -p "$g"
   while IFS= read -r rel; do git_copy "$RUNDIR/$rel" "$GIT_BASE/$rel"; done < "$okl"
-  [ -f "$RUNDIR/$sf/import_ctrl.xml" ] && cp "$RUNDIR/$sf/import_ctrl.xml" "$g/import_ctrl.xml"
-  # nicht mehr vorhandene Objekte entfernen - nur wenn alle Objektlisten des Folders lesbar waren
+  if [ -f "$RUNDIR/$sf/import_ctrl.xml" ]; then
+    if [ -n "$INCR_QUERY" ] && [ -f "$g/import_ctrl.xml" ]; then
+      # inkrementell: Shortcut-Eintraege ergaenzen statt ersetzen
+      merge_ctrl "$RUNDIR/$sf/import_ctrl.xml" "$g/import_ctrl.xml" > "$g/import_ctrl.xml.tmp" && mv "$g/import_ctrl.xml.tmp" "$g/import_ctrl.xml"
+    else
+      cp "$RUNDIR/$sf/import_ctrl.xml" "$g/import_ctrl.xml"
+    fi
+  fi
+  # nicht mehr vorhandene Objekte entfernen - nur bei Vollsicherung und wenn alle Objektlisten lesbar waren
+  [ -n "$INCR_QUERY" ] && return 0
   if [ -n "${LIST_FAILED[$1]:-}" ]; then
     warn "Git: $1 - Objektliste unvollstaendig, geloeschte Objekte werden nicht entfernt"
     return 0
@@ -368,12 +401,21 @@ git_sync_folder() {  # $1=folder
 
 git_commit() {  # $1=status
   local stat add mod del
-  # Folder, die es im Repository nicht mehr gibt (nur bei Sicherung aller Folder)
-  if [ -z "$FOLDERS" ] && [ ${#ORDERED[@]} -gt 0 ]; then
+  # ergaenzende Sicherungen (_repository) als Momentaufnahme spiegeln
+  if [ -d "$RUNDIR/_repository" ]; then
+    local keepf=""
+    # inkrementell enthaelt folders.csv nur die geaenderten Folder -> bisherige Fassung behalten
+    [ -n "$INCR_QUERY" ] && [ -f "$GIT_BASE/_repository/folders.csv" ] && keepf=$(cat "$GIT_BASE/_repository/folders.csv")
+    rm -rf "$GIT_BASE/_repository"; cp -r "$RUNDIR/_repository" "$GIT_BASE/_repository"
+    [ -n "$keepf" ] && printf '%s\n' "$keepf" > "$GIT_BASE/_repository/folders.csv"
+  fi
+  # Folder, die es im Repository nicht mehr gibt (nur bei Vollsicherung aller Folder)
+  if [ -z "$FOLDERS" ] && [ -z "$INCR_QUERY" ] && [ ${#ORDERED[@]} -gt 0 ]; then
     local d name keep_it f
     for d in "$GIT_BASE"/*/; do
       [ -d "$d" ] || continue
       name=$(basename "$d"); keep_it=0
+      [ "$name" = "_repository" ] && continue
       for f in "${ORDERED[@]}"; do [ "$(safe "$f")" = "$name" ] && keep_it=1; done
       [ -n "$EXCLUDE" ] && printf '%s\n' "$name" | grep -qE "$EXCLUDE" && keep_it=1
       [ $keep_it -eq 0 ] && { rm -rf "$d"; log "[GIT] - Folder $name existiert nicht mehr - aus Git entfernt"; }
@@ -383,7 +425,8 @@ git_commit() {  # $1=status
   stat=$(git -C "$GIT_REPO" diff --cached --no-renames --name-status 2>/dev/null)
   if [ -z "$stat" ]; then log "[GIT] - keine Aenderungen gegenueber dem letzten Backup"; return 0; fi
   add=$(printf '%s\n' "$stat" | grep -c '^A'); mod=$(printf '%s\n' "$stat" | grep -c '^M'); del=$(printf '%s\n' "$stat" | grep -c '^D')
-  if ! git_run commit -q -m "Backup $REPO $STAMP ($1): $add neu, $mod geaendert, $del geloescht" \
+  local kind="Backup"; [ -n "$INCR_QUERY" ] && kind="Inkrementell"
+  if ! git_run commit -q -m "$kind $REPO $STAMP ($1): $add neu, $mod geaendert, $del geloescht" \
          -m "Lauf: $(basename "$RUNDIR")" >> "$RUNDIR/log/git.txt" 2>&1; then
     record_error "Git: commit fehlgeschlagen (Autor konfiguriert? --git-author), siehe log/git.txt"; return 1
   fi
@@ -435,6 +478,48 @@ if [ -n "$EXCLUDE" ]; then
   for f in "${!WANT[@]}"; do printf '%s\n' "$f" | grep -qE "$EXCLUDE" && unset "WANT[$f]"; done
 fi
 
+# Inkrementell: geaenderte Objekte aus der gespeicherten Query
+# Kandidaten "zeile|folder|typ|token" - der Objektname wird spaeter gegen listobjects abgeglichen
+declare -A CAND_FT=()
+CAND="$RUNDIR/log/query_candidates.txt"
+if [ -n "$INCR_QUERY" ]; then
+  echo "query=$INCR_QUERY" > "$RUNDIR/INCREMENTAL"
+  QOUT="$RUNDIR/log/query_result.txt"; QFILE="$RUNDIR/log/query_persistent.txt"
+  if ! run_pmrep "$QOUT" executequery -q "$INCR_QUERY" -t "$QUERY_TYPE" -c "|" -u "$QFILE"; then
+    log "[FEHLER] - Query '$INCR_QUERY' ($QUERY_TYPE) nicht ausfuehrbar, siehe log/query_result.txt"
+    log "[HINWEIS] - Query im Repository Manager anlegen (Tools > Queries), siehe docs/FOLDER_BACKUP.md"
+    finish FAILED; exit 2
+  fi
+  # Quelle: persistente Datei (Komma), sonst Bildschirmausgabe (|)
+  if [ -s "$QFILE" ]; then QSRC="$QFILE"; QSEP=","; else QSRC="$QOUT"; QSEP="|"; fi
+  printf '%s\n' "$ALL_FOLDERS" > "$RUNDIR/log/all_folders.txt"
+  awk -v sep="$QSEP" -v types="$(printf '%s' "$TYPES" | tr 'A-Z' 'a-z')" '
+    NR==FNR { fold[$0]=1; next }
+    BEGIN { n=split(types, ta, ","); for (i=1;i<=n;i++) { gsub(/^[ \t]+|[ \t]+$/,"",ta[i]); known[ta[i]]=1 } }
+    {
+      line=FNR; c=split($0, a, sep); t=""; f=""
+      for (i=1;i<=c;i++) { v=a[i]; gsub(/^[ \t]+|[ \t\r]+$/,"",v); a[i]=v; if (t=="" && (tolower(v) in known)) { t=tolower(v); a[i]="" } }
+      if (t=="") next
+      for (i=1;i<=c;i++) if (f=="" && (a[i] in fold)) { f=a[i]; a[i]="" }
+      if (f=="") next
+      for (i=1;i<=c;i++) { v=a[i]
+        if (v=="" || v ~ /^[0-9]+$/ || v ~ /%3[Aa]|^[0-9]+:/ || v=="reusable" || v=="non-reusable" || tolower(v)=="none") continue
+        print line "|" f "|" t "|" v }
+    }' "$RUNDIR/log/all_folders.txt" "$QSRC" > "$CAND"
+  NQ=$(cut -d'|' -f1 "$CAND" | sort -u | wc -l | tr -d ' ')
+  log "[INKREMENTELL] - Query '$INCR_QUERY': $NQ Objekt(e) in den gesicherten Typen"
+  while IFS='|' read -r _ F T _; do CAND_FT["$F|$T"]=1; done < "$CAND"
+  # nur Folder mit Aenderungen sichern
+  for f in "${!WANT[@]}"; do
+    has=0; for k in "${!CAND_FT[@]}"; do [ "${k%|*}" = "$f" ] && { has=1; break; }; done
+    [ $has -eq 0 ] && unset "WANT[$f]"
+  done
+  if [ ${#WANT[@]} -eq 0 ]; then
+    log "[INKREMENTELL] - keine geaenderten Objekte - nichts zu sichern"
+  fi
+fi
+MATCHED="$RUNDIR/log/query_matched.txt"; : > "$MATCHED"
+
 # Shared Folder: aus -S, sonst automatisch per Probe-Export (Attribut SHARED im FOLDER-Element)
 detect_shared() {  # $1=folder -> 0 wenn shared
   local t n probe rc; probe="$RUNDIR/log/probe_$(safe "$1").xml"
@@ -457,8 +542,8 @@ else
 fi
 
 ORDERED=()
-while IFS= read -r f; do [ -n "${IS_SHARED[$f]:-}" ] && ORDERED+=("$f"); done < <(printf '%s\n' "${!WANT[@]}" | sort)
-while IFS= read -r f; do [ -z "${IS_SHARED[$f]:-}" ] && [ -n "$f" ] && ORDERED+=("$f"); done < <(printf '%s\n' "${!WANT[@]}" | sort)
+while IFS= read -r f; do [ -n "$f" ] && [ -n "${IS_SHARED[$f]:-}" ] && ORDERED+=("$f"); done < <(printf '%s\n' "${!WANT[@]}" | sort)
+while IFS= read -r f; do [ -n "$f" ] && [ -z "${IS_SHARED[$f]:-}" ] && ORDERED+=("$f"); done < <(printf '%s\n' "${!WANT[@]}" | sort)
 log "[INFO] - ${#ORDERED[@]} Folder, davon ${#IS_SHARED[@]} shared: ${!IS_SHARED[*]}"
 
 IFS=',' read -ra TYPELIST <<< "$TYPES"
@@ -486,7 +571,17 @@ for f in "${ORDERED[@]}"; do
 
   for t in "${TYPELIST[@]}"; do
     t="${t#"${t%%[![:space:]]*}"}"; t="${t%"${t##*[![:space:]]}"}"
+    TL=$(printf '%s' "$t" | tr 'A-Z' 'a-z')
+    [ -n "$INCR_QUERY" ] && [ -z "${CAND_FT["$f|$TL"]:-}" ] && continue
     OBJS=$(list_objects "$t" "$f") || { LIST_FAILED[$f]=1; record_error "$f: listobjects fuer Typ $t fehlgeschlagen"; continue; }
+    if [ -n "$INCR_QUERY" ] && [ -n "$OBJS" ]; then
+      # nur geaenderte Objekte; Name voll (DBD.NAME) oder ohne DBD-Praefix
+      OBJS=$(printf '%s\n' "$OBJS" | awk -F'|' -v f="$f" -v t="$TL" -v m="$MATCHED" '
+        NR==FNR { split($0, a, "|"); if (a[2]==f && a[3]==t) tok[a[4]]=tok[a[4]] " " a[1]; next }
+        { n=$1; s=n; sub(/^[^.]*\./, "", s)
+          hit=""; if (n in tok) hit=tok[n]; else if (t=="source" && (s in tok)) hit=tok[s]
+          if (hit!="") { print; k=split(hit, L, " "); for (i=1;i<=k;i++) if (L[i]!="") print L[i] >> m } }' "$CAND" -)
+    fi
     [ -z "$OBJS" ] && continue
     TDIR="$FDIR/$(type_index "$t")_$(safe "$(printf '%s' "$t" | tr 'A-Z ' 'a-z_')")"; mkdir -p "$TDIR"
     while IFS='|' read -r NAME SUB; do
@@ -517,6 +612,11 @@ for f in "${ORDERED[@]}"; do
 
   # Shared-Status aus den Exporten bestaetigen
   FIRST=$(find "$FDIR" -name '*.xml' -type f 2>/dev/null | head -1)
+  if [ "$EXTRAS" -eq 1 ] && [ -n "$FIRST" ]; then
+    FEL=$(tr '\r\n' '  ' < "$FIRST" | sed 's/</\n</g' | grep -m1 '^<FOLDER[[:space:]]')
+    printf '%s;%s;%s;%s;%s;%s\n' "$f" "$(get_attr "$FEL" SHARED)" "$(get_attr "$FEL" OWNER)" "$(get_attr "$FEL" GROUP)" \
+      "$(get_attr "$FEL" PERMISSIONS)" "$(get_attr "$FEL" DESCRIPTION | tr ';' ',')" >> "$RUNDIR/log/folders.part"
+  fi
   if [ -n "$FIRST" ] && grep -q '<FOLDER [^>]*SHARED *= *"SHARED"' "$FIRST" && [ -z "${IS_SHARED[$f]:-}" ]; then
     warn "$f ist ein Shared Folder, wurde aber nicht zuerst gesichert - im Restore zuerst importieren (-S angeben)"
     IS_SHARED[$f]=1
@@ -572,6 +672,49 @@ if [ -s "$ORDER" ]; then
   } > "$ORDER.tmp" && mv "$ORDER.tmp" "$ORDER"
 fi
 
+# Inkrementell: Query-Treffer, die keinem wiederverwendbaren Objekt zugeordnet werden konnten
+if [ -n "$INCR_QUERY" ] && [ -s "$CAND" ]; then
+  UNM=$(cut -d'|' -f1 "$CAND" | sort -u | grep -vxF -f <(sort -u "$MATCHED") | wc -l | tr -d ' ')
+  [ "$UNM" -gt 0 ] && log "[INKREMENTELL] - $UNM Query-Treffer ohne passendes wiederverwendbares Objekt (nicht wiederverwendbar, geloescht oder ausserhalb des Umfangs), siehe log/query_candidates.txt"
+fi
+
+# ergaenzende Sicherungen: Connections (ohne Passwoerter), Folder, ausgecheckte Objekte, globale Objekte
+backup_extras() {
+  local x="$RUNDIR/_repository" line name typ
+  mkdir -p "$x/connections"
+  if run_pmrep "$x/connections.txt" listconnections -t; then
+    while IFS= read -r line; do
+      line="${line%$'\r'}"; is_noise "$line" && continue
+      name=$(printf '%s' "$line" | awk -F'[,| \t]+' '{ for (i=1;i<=NF;i++) if ($i!="") { print $i; exit } }')
+      typ=$(printf '%s' "$line" | tr ',| \t' '\n\n\n\n' | grep -ixE 'relational|application|ftp|loader|queue' | head -1)
+      [ -z "$name" ] && continue
+      if run_pmrep "$x/connections/$(safe "$name").tmp" getconnectiondetails -n "$name" -t "${typ:-relational}"; then
+        grep -viE 'password|passwort' "$x/connections/$(safe "$name").tmp" > "$x/connections/$(safe "$name").txt"
+      else
+        warn "Extras: Details fuer Connection $name nicht lesbar"
+      fi
+      rm -f "$x/connections/$(safe "$name").tmp"
+    done < "$x/connections.txt"
+    grep -viE 'password|passwort' "$x/connections.txt" > "$x/connections.tmp" && mv "$x/connections.tmp" "$x/connections.txt"
+  else
+    warn "Extras: listconnections fehlgeschlagen, siehe _repository/connections.txt"
+  fi
+  if [ -s "$RUNDIR/log/folders.part" ]; then
+    { echo "folder;shared;owner;group;permissions;beschreibung"; cat "$RUNDIR/log/folders.part"; } > "$x/folders.csv"
+  fi
+  if run_pmrep "$x/checkouts.txt" findcheckout -u -c "|"; then
+    local nco; nco=$(while IFS= read -r line; do is_noise "${line%$'\r'}" || echo x; done < "$x/checkouts.txt" | grep -c x)
+    [ "$nco" -gt 0 ] && warn "$nco ausgecheckte(s) Objekt(e) - das Backup enthaelt die zuletzt eingecheckte Version, siehe _repository/checkouts.txt"
+  else
+    log "[INFO] - findcheckout nicht verfuegbar (nicht versioniertes Repository?) - siehe _repository/checkouts.txt"
+  fi
+  for o in label:labels deploymentgroup:deploymentgroups query:queries; do
+    run_pmrep "$x/${o#*:}.txt" listobjects -o "${o%%:*}" || log "[INFO] - listobjects -o ${o%%:*} nicht verfuegbar"
+  done
+  log "[EXTRAS] - Connections, Folder-Eigenschaften, Checkouts, Labels, Deployment Groups, Queries in _repository/"
+}
+[ "$EXTRAS" -eq 1 ] && backup_extras
+
 # Formatwarnungen aus listobjects uebernehmen
 if [ -s "$RUNDIR/log/format_warnings.txt" ]; then
   while IFS= read -r L; do warn "$L"; done < "$RUNDIR/log/format_warnings.txt"
@@ -587,12 +730,17 @@ log "[ERGEBNIS] - $RESULT: $N_OK von $N_OBJ Objekten gesichert, $ERRORS Fehler, 
 log "[ERGEBNIS] - Manifest: $MANIFEST"
 log "[ERGEBNIS] - Import-Reihenfolge: $ORDER"
 finish "$RESULT"
-[ "$RESULT" = "SUCCESS" ] && echo "$(basename "$RUNDIR")" > "$BASEDIR/LATEST_SUCCESS"
+if [ "$RESULT" = "SUCCESS" ]; then
+  if [ -n "$INCR_QUERY" ]; then basename "$RUNDIR" > "$BASEDIR/LATEST_INCREMENTAL"
+  else basename "$RUNDIR" > "$BASEDIR/LATEST_SUCCESS"; fi
+fi
 
 # Aufbewahrung: nur nach Erfolg; alles aelter als das N-te erfolgreiche Backup loeschen
-if [ "$RESULT" = "SUCCESS" ] && [ "$KEEP" -gt 0 ]; then
+if [ "$RESULT" = "SUCCESS" ] && [ "$KEEP" -gt 0 ] && [ -z "$INCR_QUERY" ]; then
   PREFIX="$(printf '%s' "$REPO" | tr -c 'A-Za-z0-9_.\n-' '_')_"
-  CUT=$(find "$BASEDIR" -maxdepth 2 -path "$BASEDIR/$PREFIX*/SUCCESS" -type f 2>/dev/null | sed 's|/SUCCESS$||' | sort -r | sed -n "${KEEP}p")
+  # nur Vollsicherungen zaehlen (ohne Marker INCREMENTAL); aeltere inkrementelle Laeufe werden mit geloescht
+  CUT=$(find "$BASEDIR" -maxdepth 2 -path "$BASEDIR/$PREFIX*/SUCCESS" -type f 2>/dev/null | sed 's|/SUCCESS$||' |
+        while IFS= read -r D; do [ -f "$D/INCREMENTAL" ] || echo "$D"; done | sort -r | sed -n "${KEEP}p")
   if [ -n "$CUT" ]; then
     find "$BASEDIR" -maxdepth 1 -type d -name "$PREFIX*" 2>/dev/null | sort | while IFS= read -r D; do
       [[ "$D" < "$CUT" ]] && { rm -rf "$D"; echo "$(date '+%Y-%m-%d %H:%M:%S') [AUFRAEUMEN] - $(basename "$D") geloescht" >> "$LOG"; }
