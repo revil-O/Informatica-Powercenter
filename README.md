@@ -20,10 +20,14 @@ Ergaenzt `pmrep backup`, ersetzt es nicht (Connections, Berechtigungen u.a. sind
 
 Optional versioniert in Git (`--git` / `-GitRepo`): Aenderungshistorie je Objekt, Zeitstempel im XML-Kopf neutralisiert,
 fehlgeschlagene Exporte behalten ihre letzte Version.
+Wahlweise inkrementell (`--incremental QUERY` / `-Incremental`): nur Objekte aus einer gespeicherten Repository-Query,
+z.B. taeglich inkrementell und woechentlich voll. Zusaetzlich landen Connections (ohne Passwoerter), Folder-Eigenschaften,
+ausgecheckte Objekte, Labels, Deployment Groups und Queries als Nachschlagewerk in `_repository/`.
 
 `folder_restore.sh` / `folder_restore.ps1` spielt einen Lauf wieder ein - alles, einzelne Folder oder Objekte, in
 Import-Reihenfolge, mit Pruefsummenkontrolle, Auswertung der Import-Logs (`renamed` = Duplikat) und optionaler Validierung.
-Standard ist Trockenlauf; mit `--create-folders` auch als Probe-Restore in ein Sandbox-Repository.
+Standard ist Trockenlauf; mit `--create-folders` auch als Probe-Restore in ein Sandbox-Repository,
+mit `--with-incrementals` / `-WithIncrementals` aus Vollsicherung plus neueren inkrementellen Laeufen.
 
 ```bash
 ./folder_restore.sh -c folder_backup.conf                                   # Trockenlauf, letzter erfolgreicher Lauf

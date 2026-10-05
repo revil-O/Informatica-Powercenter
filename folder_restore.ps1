@@ -17,6 +17,11 @@
   Trockenlauf fuer den letzten erfolgreichen Lauf (LATEST_SUCCESS).
 
 .EXAMPLE
+  .\folder_restore.ps1 -ConfigFile .\folder_backup.conf -WithIncrementals -Folders DWH
+
+  Letzte Vollsicherung plus alle neueren inkrementellen Laeufe; je Datei gewinnt die neueste Version.
+
+.EXAMPLE
   .\folder_restore.ps1 -ConfigFile .\sandbox.conf -Repository PM_SANDBOX -CreateFolders -Validate -Execute -Yes
 
   Probe-Restore in ein Sandbox-Repository.
@@ -34,6 +39,7 @@ param(
   [string]$Run,                               # Laufverzeichnis (Name oder Pfad); Standard: LATEST_SUCCESS
   [string[]]$Folders = @(),
   [string]$ObjectFilter,                      # Regex auf den Dateipfad, z.B. 'DWH/06_mapping/m_load_sales'
+  [switch]$WithIncrementals,                  # neuere inkrementelle Laeufe ueberlagern (neueste Version je Datei)
   [string]$Dtd,
   [string]$WorkDir,
   [switch]$CreateFolders,
@@ -141,58 +147,115 @@ try {
   if ($bStatus -eq 'PARTIAL') { Write-Warn 'Backup-Lauf ist PARTIAL - fehlende Objekte siehe manifest.csv (Status FEHLER)' }
   elseif ($bStatus -ne 'SUCCESS') { Write-Warn "Backup-Lauf hat Status $(if ($bStatus) { $bStatus } else { 'unbekannt' }) - Restore nur mit Vorsicht" }
 
+  ### ------------------------------------------------------------ Laeufe: Basis + ggf. neuere inkrementelle Laeufe
+  $runs = New-Object System.Collections.Generic.List[string]; $runs.Add($RunDir)
+  if (Test-Path (Join-Path $RunDir 'INCREMENTAL')) { Write-Warn 'der gewaehlte Lauf ist inkrementell - er enthaelt nur geaenderte Objekte' }
+  if ($WithIncrementals) {
+    $rprefix = (Split-Path $RunDir -Leaf) -replace '_[0-9]{8}_[0-9]{6}.*$', ''
+    foreach ($d in Get-ChildItem -Path $BackupDir -Directory -Filter "${rprefix}_*_inc*" | Sort-Object Name) {
+      if ([string]::CompareOrdinal($d.Name, (Split-Path $RunDir -Leaf)) -le 0) { continue }
+      if (-not (Test-Path (Join-Path $d.FullName 'INCREMENTAL'))) { continue }
+      if (Test-Path (Join-Path $d.FullName 'RUNNING')) { Write-Warn "inkrementeller Lauf $($d.Name) laeuft noch oder wurde abgebrochen - wird uebersprungen"; continue }
+      $okRun = ((Test-Path (Join-Path $d.FullName 'SUCCESS')) -or (Test-Path (Join-Path $d.FullName 'PARTIAL'))) -and (Test-Path (Join-Path $d.FullName 'import_order.txt'))
+      if ($okRun) { $runs.Add($d.FullName); Write-Log "[INFO] - inkrementeller Lauf einbezogen: $($d.Name)" }
+      else { Write-Warn "inkrementeller Lauf $($d.Name) ist fehlgeschlagen - wird uebersprungen" }
+    }
+    if ($runs.Count -eq 1) { Write-Log '[INFO] - keine neueren inkrementellen Laeufe gefunden' }
+  }
+
   ### ------------------------------------------------------------ Auswahl
-  $order = @(Get-Content (Join-Path $RunDir 'import_order.txt') | Where-Object { $_ } | ForEach-Object {
-    $c = $_ -split '\|'; if ($c.Count -ge 3) { [pscustomobject]@{ Folder = $c[0]; Rel = $c[1]; Ctrl = $c[2] } } })
-  $sel = @($order | Where-Object { $Folders.Count -eq 0 -or $Folders -ccontains $_.Folder })
+  # je Datei gewinnt der neueste Lauf; Folder-Reihenfolge wie im Basislauf (Shared zuerst), neue Folder dahinter
+  $latest = [ordered]@{}; $folderPos = @{}; $allFolderNames = @{}
+  for ($ri = 0; $ri -lt $runs.Count; $ri++) {
+    foreach ($line in Get-Content (Join-Path $runs[$ri] 'import_order.txt')) {
+      $c = $line -split '\|'; if ($c.Count -lt 3) { continue }
+      $allFolderNames[$c[0]] = $true
+      if ($Folders.Count -gt 0 -and $Folders -cnotcontains $c[0]) { continue }
+      if (-not $folderPos.ContainsKey($c[0])) { $folderPos[$c[0]] = $folderPos.Count }
+      $latest[($c[1] -replace '\\', '/')] = [pscustomobject]@{ Folder = $c[0]; Rel = ($c[1] -replace '\\', '/'); Ctrl = $c[2]; Run = $ri }
+    }
+  }
+  $sel = @($latest.Values | Sort-Object @{ Expression = { $folderPos[$_.Folder] } }, @{ Expression = { $_.Rel } })
   if ($ObjectFilter) { $sel = @($sel | Where-Object { $_.Rel -match $ObjectFilter }) }
-  foreach ($f in $Folders) { if (-not ($order | Where-Object { $_.Folder -ceq $f })) { Add-Error "Folder $f ist nicht im Backup-Lauf" } }
+  foreach ($f in $Folders) { if (-not $allFolderNames.ContainsKey($f)) { Add-Error "Folder $f ist nicht im Backup-Lauf" } }
   if ($sel.Count -eq 0) { Write-Log '[FEHLER] - keine Dateien ausgewaehlt'; exit 2 }
-  Write-Log ("[INFO] - {0} Datei(en) in {1} Folder(n) ausgewaehlt" -f $sel.Count, @($sel | Select-Object -ExpandProperty Folder -Unique).Count)
+  $incTxt = ''; if ($runs.Count -gt 1) { $incTxt = ", davon $(@($sel | Where-Object { $_.Run -gt 0 }).Count) aus inkrementellen Laeufen" }
+  Write-Log ("[INFO] - {0} Datei(en) in {1} Folder(n) ausgewaehlt{2}" -f $sel.Count, @($sel | Select-Object -ExpandProperty Folder -Unique).Count, $incTxt)
 
   ### ------------------------------------------------------------ Dateien bereitstellen und pruefen
-  $manifest = @{}
-  foreach ($m in (Import-Csv (Join-Path $RunDir 'manifest.csv') -Delimiter ';')) { $manifest[($m.datei -replace '\\', '/')] = $m }
-  $prepared = @{}; $ctrlDone = @{}; $folderShared = @{}; $items = New-Object System.Collections.Generic.List[object]
+  $manifests = @{}
+  function Get-RunManifest([int]$Ri) {
+    if (-not $manifests.ContainsKey($Ri)) {
+      $mm = @{}; foreach ($m in (Import-Csv (Join-Path $runs[$Ri] 'manifest.csv') -Delimiter ';')) { $mm[($m.datei -replace '\\', '/')] = $m }
+      $manifests[$Ri] = $mm
+    }
+    return $manifests[$Ri]
+  }
+  # Folder eines Laufs bereitstellen: Verzeichnis direkt, Archiv ins Arbeitsverzeichnis auspacken -> Basisverzeichnis
+  $pbase = @{}
+  function Get-FolderBase([int]$Ri, [string]$Sf) {
+    $k = "$Ri|$Sf"
+    if ($pbase.ContainsKey($k)) { return $pbase[$k] }
+    $run = $runs[$Ri]; $x = Join-Path (Join-Path $WorkDir 'extract') "$Ri"
+    $zip = Join-Path $run "$Sf.zip"; $tgz = Join-Path $run "$Sf.tar.gz"
+    $b = $null
+    if (Test-Path (Join-Path $run $Sf) -PathType Container) { $b = $run }
+    elseif (Test-Path $zip) { New-Item -ItemType Directory -Force -Path $x | Out-Null; Expand-Archive -Path $zip -DestinationPath $x -Force; $b = $x }
+    elseif (Test-Path $tgz) { New-Item -ItemType Directory -Force -Path $x | Out-Null; & tar xzf $tgz -C $x; if ($LASTEXITCODE -eq 0) { $b = $x } }
+    $pbase[$k] = $b
+    return $b
+  }
+  # Control-Files zusammenfuehren: FOLDERMAP- und SPECIFICOBJECT-Zeilen aus $Add in $Base ergaenzen
+  function Merge-Ctrl([string]$Add, [string]$Base) {
+    $addL = @(Get-Content $Add); $baseL = @(Get-Content $Base)
+    $seen = @{}; foreach ($l in $baseL) { $seen[$l] = $true }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($l in $baseL) {
+      if ($l -match '<RESOLVECONFLICT>') { foreach ($xl in $addL) { if ($xl -match '<FOLDERMAP ' -and -not $seen.ContainsKey($xl)) { $out.Add($xl); $seen[$xl] = $true } } }
+      if ($l -match '<TYPEOBJECT ') { foreach ($xl in $addL) { if ($xl -match '<SPECIFICOBJECT ' -and -not $seen.ContainsKey($xl)) { $out.Add($xl); $seen[$xl] = $true } } }
+      $out.Add($l)
+    }
+    [IO.File]::WriteAllLines($Base, [string[]]$out, $Utf8NoBom)
+  }
+
+  $ctrlSrc = [ordered]@{}; $folderShared = @{}; $items = New-Object System.Collections.Generic.List[object]
   foreach ($it in $sel) {
-    $rel = $it.Rel -replace '\\', '/'; $sf = $rel.Split('/')[0]
-    if (-not $prepared.ContainsKey($sf)) {
-      $srcFolder = Join-Path $RunDir $sf; $zip = Join-Path $RunDir "$sf.zip"; $tgz = Join-Path $RunDir "$sf.tar.gz"
-      if (Test-Path $srcFolder -PathType Container) { $prepared[$sf] = 'dir' }
-      elseif (Test-Path $zip) { Expand-Archive -Path $zip -DestinationPath $SrcDir -Force; $prepared[$sf] = 'archiv' }
-      elseif (Test-Path $tgz) { & tar xzf $tgz -C $SrcDir; $prepared[$sf] = 'archiv' }
-      else { $prepared[$sf] = 'fehlt' }
-    }
-    if ($prepared[$sf] -eq 'fehlt') { Add-Error "$($it.Folder): weder Verzeichnis noch Archiv $sf.zip/.tar.gz im Backup-Lauf"; continue }
-    $dst = Join-Path $SrcDir $rel
-    if ($prepared[$sf] -eq 'dir') {
-      $src = Join-Path $RunDir $rel
-      if (-not (Test-Path $src)) { Add-Error "$($it.Folder): $rel fehlt im Backup-Lauf"; continue }
-      New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-      Copy-Item $src $dst -Force
-      $ctrlSrc = Join-Path $RunDir $it.Ctrl; $ctrlDst = Join-Path $SrcDir $it.Ctrl
-      if ((Test-Path $ctrlSrc) -and -not (Test-Path $ctrlDst)) { Copy-Item $ctrlSrc $ctrlDst }
-    }
-    if (-not (Test-Path $dst)) { Add-Error "$($it.Folder): $rel fehlt im Backup-Lauf"; continue }
-    if (-not $NoVerify -and $manifest.ContainsKey($rel) -and $manifest[$rel].sha256 -and $manifest[$rel].sha256 -ne '-') {
-      if ((Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -ne $manifest[$rel].sha256.ToLower()) {
-        Add-Error "$($it.Folder): $rel - Pruefsumme stimmt nicht mit manifest.csv ueberein, wird nicht importiert"; continue
+    $rel = $it.Rel; $sf = $rel.Split('/')[0]; $runName = Split-Path $runs[$it.Run] -Leaf
+    $b = Get-FolderBase $it.Run $sf
+    if (-not $b) { Add-Error "$($it.Folder): weder Verzeichnis noch Archiv $sf.zip/.tar.gz in $runName"; continue }
+    $src = Join-Path $b $rel; $dst = Join-Path $SrcDir $rel
+    if (-not (Test-Path $src)) { Add-Error "$($it.Folder): $rel fehlt in $runName"; continue }
+    New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+    Copy-Item $src $dst -Force
+    $man = Get-RunManifest $it.Run
+    if (-not $NoVerify -and $man.ContainsKey($rel) -and $man[$rel].sha256 -and $man[$rel].sha256 -ne '-') {
+      if ((Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower() -ne $man[$rel].sha256.ToLower()) {
+        Add-Error "$($it.Folder): $rel - Pruefsumme stimmt nicht mit manifest.csv ($runName) ueberein, wird nicht importiert"; continue
       }
     }
-    $ctrl = Join-Path $SrcDir $it.Ctrl
-    if (-not $ctrlDone.ContainsKey($it.Ctrl)) {
-      if (-not (Test-Path $ctrl)) { Add-Error "$($it.Folder): Control-File $($it.Ctrl) fehlt"; continue }
-      # Control-File anpassen: Ziel-Repository, ggf. Check-in
-      $t = [IO.File]::ReadAllText($ctrl)
-      $t = [regex]::Replace($t, 'TARGETREPOSITORYNAME="[^"]*"', { param($m) 'TARGETREPOSITORYNAME="' + (ConvertTo-XmlAttr $Repository) + '"' })
-      if ($Checkin) { $t = $t.Replace('CHECKIN_AFTER_IMPORT="NO"', 'CHECKIN_AFTER_IMPORT="YES" CHECKIN_COMMENTS="' + (ConvertTo-XmlAttr $Checkin) + '"') }
-      [IO.File]::WriteAllText($ctrl, $t, $Utf8NoBom)
-      Copy-Item $Dtd (Join-Path (Split-Path $ctrl) 'impcntl.dtd') -Force
-      $ctrlDone[$it.Ctrl] = $true
-    }
+    # Control-File-Quellen je Folder sammeln (alle beteiligten Laeufe)
+    $cs = Join-Path $b $it.Ctrl
+    if (-not $ctrlSrc.Contains($it.Ctrl)) { $ctrlSrc[$it.Ctrl] = New-Object System.Collections.Generic.List[string] }
+    if (-not $ctrlSrc[$it.Ctrl].Contains($cs)) { $ctrlSrc[$it.Ctrl].Add($cs) }
     if (-not $folderShared.ContainsKey($it.Folder)) { $folderShared[$it.Folder] = [bool](Select-String -Path $dst -Pattern '<FOLDER [^>]*SHARED *= *"SHARED"' -Quiet) }
-    $items.Add([pscustomobject]@{ Folder = $it.Folder; Rel = $rel; Ctrl = $it.Ctrl; Src = $dst; CtrlPath = $ctrl })
+    $items.Add([pscustomobject]@{ Folder = $it.Folder; Rel = $rel; Ctrl = $it.Ctrl; Src = $dst; CtrlPath = (Join-Path $SrcDir $it.Ctrl); Run = $it.Run })
   }
+
+  # Control-Files: erstes als Basis, die weiteren zusammenfuehren, dann anpassen (Ziel-Repository, ggf. Check-in)
+  $badCtrl = @{}
+  foreach ($ck in @($ctrlSrc.Keys)) {
+    $srcs = $ctrlSrc[$ck]; $ctrl = Join-Path $SrcDir $ck
+    New-Item -ItemType Directory -Force -Path (Split-Path $ctrl) | Out-Null
+    if (-not (Test-Path $srcs[0])) { Add-Error "Control-File $ck fehlt"; $badCtrl[$ck] = $true; continue }
+    Copy-Item $srcs[0] $ctrl -Force
+    for ($k = 1; $k -lt $srcs.Count; $k++) { if (Test-Path $srcs[$k]) { Merge-Ctrl $srcs[$k] $ctrl } }
+    $t = [IO.File]::ReadAllText($ctrl)
+    $t = [regex]::Replace($t, 'TARGETREPOSITORYNAME="[^"]*"', { param($m) 'TARGETREPOSITORYNAME="' + (ConvertTo-XmlAttr $Repository) + '"' })
+    if ($Checkin) { $t = $t.Replace('CHECKIN_AFTER_IMPORT="NO"', 'CHECKIN_AFTER_IMPORT="YES" CHECKIN_COMMENTS="' + (ConvertTo-XmlAttr $Checkin) + '"') }
+    [IO.File]::WriteAllText($ctrl, $t, $Utf8NoBom)
+    Copy-Item $Dtd (Join-Path (Split-Path $ctrl) 'impcntl.dtd') -Force
+  }
+  if ($badCtrl.Count -gt 0) { $items = [System.Collections.Generic.List[object]]@($items | Where-Object { -not $badCtrl.ContainsKey($_.Ctrl) }) }
 
   ### ------------------------------------------------------------ Verbindung, Ziel-Folder
   if (-not [Environment]::GetEnvironmentVariable($PasswordVar)) {
@@ -278,7 +341,8 @@ try {
       $report.Add([pscustomobject]@{ folder = $i.Folder; datei = $i.Rel; import = 'OK'; validierung = ''; meldung = '' })
     }
     $nOk++
-    if ($manifest.ContainsKey($i.Rel)) { $toValidate += [pscustomobject]@{ Folder = $manifest[$i.Rel].folder; Type = $manifest[$i.Rel].typ; Name = $manifest[$i.Rel].name; Rel = $i.Rel } }
+    $man = Get-RunManifest $i.Run
+    if ($man.ContainsKey($i.Rel)) { $toValidate += [pscustomobject]@{ Folder = $man[$i.Rel].folder; Type = $man[$i.Rel].typ; Name = $man[$i.Rel].name; Rel = $i.Rel } }
   }
 
   ### ------------------------------------------------------------ Validierung

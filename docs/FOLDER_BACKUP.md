@@ -3,7 +3,8 @@
 Howto fuer `folder_backup.sh` / `folder_backup.ps1` und `folder_restore.sh` / `folder_restore.ps1`
 (Linux / Windows): Sicherung eines PowerCenter-Repositorys **Folder fuer Folder** als importierbare
 XML-Exporte - erst die Shared Folder, danach alle anderen, gruppiert nach Objekttyp in Import-Reihenfolge -,
-optional versioniert in Git, mit Restore-Skript und Probe-Restore. Steuerbar als Command Task aus einem Workflow.
+optional versioniert in Git, wahlweise inkrementell, mit ergaenzenden Sicherungen (Connections, Folder,
+Checkouts), Restore-Skript und Probe-Restore. Steuerbar als Command Task aus einem Workflow.
 
 ## Wozu - und wozu nicht
 
@@ -18,6 +19,8 @@ optional versioniert in Git, mit Restore-Skript und Probe-Restore. Steuerbar als
 **Nicht** in den XML-Exporten enthalten: Connections (Relational/Application), Benutzer, Gruppen und
 Berechtigungen, Folder-Eigenschaften und -Rechte, Deployment Groups, Labels, Queries, OS-Profile,
 Integration-Service-Einstellungen sowie Dateien auf dem Server (Parameterdateien, Skripte, Lookup-Caches).
+Einen Teil davon sichert `folder_backup` als **Nachschlagewerk** in `_repository/` (siehe
+[Ergaenzende Sicherungen](#ergaenzende-sicherungen)) - wiederherstellbar ist er damit nicht.
 Deshalb: folderweises Backup **zusaetzlich** zu einem regelmaessigen `pmrep backup`, nicht statt dessen.
 
 ## Ablauf
@@ -29,7 +32,10 @@ connect ─► Folderliste ─► Shared Folder erkennen ─► Shared Folder zu
                   listobjects ─► objectexport je Objekt ─► Pruefung ─► Manifest
                   (Fehler: Wiederholung mit Neuverbindung, danach FEHLER im Manifest, .xml.failed)
              └─ je Folder: import_ctrl.xml (Shortcuts REUSE), optional packen
+         ─► _repository/ (Connections, Folder, Checkouts, Labels, ...) ─► Git (optional)
          ─► import_order.txt ─► Status SUCCESS / PARTIAL / FAILED ─► Aufbewahrung ─► Exitcode
+
+Inkrementell (--incremental QUERY): vorher executequery ─► nur Folder/Objekte aus dem Query-Ergebnis
 ```
 
 ## Voraussetzungen
@@ -97,6 +103,9 @@ bricht es dann mit Exitcode 2 ab.
 | `GIT_REPO` | `--git` | `-GitRepo` | Exporte zusaetzlich in dieses Git-Repository uebernehmen (siehe unten) |
 | `GIT_AUTHOR` | `--git-author` | `-GitAuthor` | Autor der Commits, `Name <mail>` |
 | `GIT_PUSH` | `--git-push` | `-GitPush` | nach dem Commit pushen (`1`/`0`) |
+| `INCR_QUERY` | `--incremental` | `-Incremental` | inkrementell: gespeicherte Repository-Query (siehe unten) |
+| `QUERY_TYPE` | `--query-type` | `-QueryType` | `shared` (Standard) oder `personal` |
+| `EXTRAS` | `--no-extras` | `-NoExtras` | ergaenzende Sicherungen (`1` = an, Standard; `0` bzw. Option = aus) |
 | - | `--list` | `-List` | Trockenlauf: nur Folder und Objektanzahl |
 
 Kommandozeilen-Optionen ueberschreiben Werte aus der Konfigurationsdatei.
@@ -148,13 +157,16 @@ der Restore funktioniert dann aber nur vollstaendig in der Reihenfolge von `impo
 
 ```
 <BASEDIR>/
-├── LATEST_SUCCESS                       Name des letzten erfolgreichen Laufs
+├── LATEST_SUCCESS                       letzte erfolgreiche Vollsicherung
+├── LATEST_INCREMENTAL                   letzter erfolgreicher inkrementeller Lauf
+├── PM_PROD_20261006_220000_inc/         inkrementeller Lauf (Marker-Datei INCREMENTAL, nur geaenderte Objekte)
 ├── PM_PROD_20261005_220000/
 │   ├── SUCCESS | PARTIAL | FAILED       Statusdatei mit Zaehlern (waehrend des Laufs: RUNNING)
 │   ├── backup.log                       Protokoll
 │   ├── manifest.csv                     folder;typ;name;datei;bytes;sha256;status;meldung
 │   ├── import_order.txt                 folder|xml-datei|control-file - in Import-Reihenfolge
 │   ├── log/                             alle pmrep-Ausgaben (connect, listobjects, export je Objekt)
+│   ├── _repository/                     ergaenzende Sicherungen (Connections, Folder, Checkouts, ...)
 │   ├── SHARED/                          Shared Folder zuerst
 │   │   ├── 01_source/ORA.CUST.xml
 │   │   ├── 04_transformation/LKP_CUST.xml
@@ -190,6 +202,10 @@ seine Shortcuts zeigen, `REUSE` fuer alle Shortcuts (ein `REPLACE` wuerde bei Sh
 | Shared Folder erst nachtraeglich erkannt | Warnung; `import_order.txt` beruecksichtigt ihn trotzdem zuerst |
 | Archiv fehlerhaft (`ZIP`) | `FEHLER`, XML-Dateien bleiben erhalten |
 | Fehlerzahl erreicht `MAX_ERRORS` bzw. `FAIL_FAST` | Abbruch, Status `FAILED`, Exitcode 2 |
+| Inkrementell: Query nicht vorhanden / nicht ausfuehrbar | Abbruch, Status `FAILED`, Exitcode 2 |
+| Inkrementell: Query-Treffer ohne wiederverwendbares Objekt | Info im Log (nicht wiederverwendbar, geloescht, ausserhalb des Umfangs) |
+| Ergaenzende Sicherung fehlgeschlagen (z.B. `listconnections`) | Warnung - das Backup bleibt gueltig |
+| ausgecheckte Objekte (versioniertes Repository) | Warnung - gesichert ist die zuletzt eingecheckte Version |
 | Abbruch per Signal / Strg+C | Status `FAILED`, Sperre und Verbindungsdatei werden entfernt |
 
 **Exitcodes:** `0` = SUCCESS (oder PARTIAL mit `PARTIAL_OK=1`), `1` = PARTIAL (einzelne Objekte fehlen),
@@ -199,6 +215,75 @@ seine Shortcuts zeigen, `REUSE` fuer alle Shortcuts (ein `REPLACE` wuerde bei Sh
 als das N-te erfolgreiche Backup - fehlgeschlagene Laeufe dazwischen inklusive. Es bleiben also immer
 mindestens N gute Backups. Pro Job ein eigenes `BASEDIR` verwenden, sonst raeumen sich Jobs mit
 unterschiedlichem Umfang gegenseitig auf.
+
+## Inkrementelles Backup
+
+Bei grossen Repositories dauert die Vollsicherung lange (ein pmrep-Aufruf je Objekt). Ein inkrementeller Lauf
+sichert nur die Objekte, die eine **gespeicherte Repository-Query** liefert - typischerweise alles, was in den
+letzten Tagen gespeichert wurde.
+
+**1. Query einmalig anlegen** (Repository Manager, als Shared Query, damit der Service-User sie ausfuehren darf):
+
+1. *Tools → Queries → New*
+2. Name: `Q_CHANGED_2D`, Typ: **Shared**
+3. Bedingung: `Last saved time` - `Within last (days)` - `2`
+4. Speichern. Test: `pmrep executequery -q Q_CHANGED_2D -t shared`
+
+Zwei Tage statt einem Tag ueberlappen absichtlich: faellt ein Lauf aus, wird nichts verpasst. Mehrfach
+gesicherte Objekte schaden nicht.
+
+**2. Aufruf**
+
+```bash
+./folder_backup.sh -c folder_backup.conf --incremental Q_CHANGED_2D
+```
+```powershell
+.\folder_backup.ps1 -ConfigFile .\folder_backup.conf -Incremental Q_CHANGED_2D
+```
+
+**Verhalten**
+
+| | Vollsicherung | inkrementeller Lauf |
+|---|---|---|
+| Laufverzeichnis | `<REPO>_<Zeitstempel>` | `<REPO>_<Zeitstempel>_inc` + Marker `INCREMENTAL` |
+| Umfang | alle Objekte der Folder | nur Query-Treffer (im Rahmen von `FOLDERS`, `EXCLUDE`, `TYPES`) |
+| Zeiger | `LATEST_SUCCESS` | `LATEST_INCREMENTAL` |
+| Aufbewahrung (`KEEP`) | zaehlt, raeumt auf | zaehlt nicht; aeltere inkrementelle Laeufe verschwinden mit der Vollsicherung |
+| Git | spiegelt alles, entfernt geloeschte Objekte | aktualisiert nur, **loescht nie**; Control-Files werden zusammengefuehrt |
+| geloeschte Objekte | erkannt | nicht erkennbar - erst die naechste Vollsicherung |
+
+Die Query liefert Objekt-IDs, Folder, Typ und Name. Das Skript ordnet jeden Treffer ueber `listobjects` einem
+wiederverwendbaren Objekt zu. Nicht wiederverwendbare Objekte (z.B. eine Session innerhalb eines Workflows)
+werden nicht einzeln gesichert - der Workflow selbst wird beim Speichern mitgeaendert und ist dann Treffer.
+Treffer ohne Zuordnung stehen in `log/query_candidates.txt`.
+
+**Empfohlener Rhythmus:** taeglich inkrementell, woechentlich voll (siehe Workflow-Steuerung).
+
+**Restore:** `folder_restore --with-incrementals` / `-WithIncrementals` legt alle neueren inkrementellen
+Laeufe ueber die Vollsicherung - je Datei wird die neueste Version importiert (siehe Restore).
+
+## Ergaenzende Sicherungen
+
+Jeder Lauf (voll und inkrementell) schreibt zusaetzlich ein Verzeichnis `_repository/` - als Nachschlagewerk
+fuer Dinge, die nicht in den Objekt-Exporten stehen. Abschalten mit `EXTRAS=0` / `--no-extras` / `-NoExtras`.
+
+| Datei | Inhalt | pmrep |
+|---|---|---|
+| `connections.txt` | alle Connections mit Typ/Subtyp | `listconnections -t` |
+| `connections/<name>.txt` | Details je Connection: User, Connect String, Code Page, Attribute - **ohne Passwort** (Zeilen mit „password“ werden entfernt) | `getconnectiondetails` |
+| `folders.csv` | Folder, Shared, Owner, Gruppe, Permissions, Beschreibung (aus dem `FOLDER`-Element der Exporte) | - |
+| `checkouts.txt` | ausgecheckte Objekte aller User (nur versionierte Repositories) | `findcheckout -u` |
+| `labels.txt`, `deploymentgroups.txt`, `queries.txt` | Namen der globalen Objekte | `listobjects -o ...` |
+
+- Fehler hier sind **Warnungen** - das Backup bleibt gueltig.
+- Ausgecheckte Objekte erzeugen eine Warnung: im Backup steht die zuletzt **eingecheckte** Version.
+- Wiederhergestellt wird `_repository/` nicht automatisch. Connections nach einem Restore in eine neue Umgebung
+  anhand von `connections/` im Workflow Manager anlegen, Passwoerter separat.
+- `permissions` stammt aus dem Export-Attribut und bildet die feingranularen Rechte neuerer Versionen
+  (Objekt-Berechtigungen, Gruppen) nicht vollstaendig ab.
+- Benutzer und Gruppen gehoeren zur Domain, nicht zum Repository - sie sind mit `infacmd isp` zu sichern
+  (nicht Teil dieser Skripte).
+- Mit Git-Versionierung wird `_repository/` mitversioniert: Aenderungen an Connections werden so sichtbar.
 
 ## Versionierung mit Git
 
@@ -296,7 +381,14 @@ $$BACKUP_MODE=objects
 $PMRootDir/scripts/folder_backup.sh -c $PMRootDir/scripts/folder_backup.conf -F $$BACKUP_FOLDERS -m $$BACKUP_MODE
 ```
 
-**Zeitplan:** taeglich ausserhalb der Ladefenster (Exporte belasten den Repository Service).
+**Zeitplan:** ausserhalb der Ladefenster (Exporte belasten den Repository Service), z.B.
+
+| Workflow | Zeitplan | Command (Linux; Windows analog mit `folder_backup.ps1`) |
+|---|---|---|
+| `wf_ADMIN_FOLDER_BACKUP_FULL` | sonntags 22:00 | `$PMRootDir/scripts/folder_backup.sh -c $PMRootDir/scripts/folder_backup.conf` |
+| `wf_ADMIN_FOLDER_BACKUP_INC` | Mo-Sa 22:00 | `$PMRootDir/scripts/folder_backup.sh -c $PMRootDir/scripts/folder_backup.conf --incremental Q_CHANGED_2D` |
+
+Beide nutzen dasselbe `BASEDIR` - die Sperre verhindert, dass sie gleichzeitig laufen.
 Der Workflow-User braucht Leserechte auf die Folder; das Skript laeuft unter dem Betriebssystem-User
 des Integration Service - dieser braucht Schreibrecht auf `BASEDIR`.
 
@@ -329,6 +421,7 @@ Der Backup-Lauf wird nie veraendert: alles passiert in einem Arbeitsverzeichnis 
 | `-d`, `-n`, `-s`, `-X`, `-P` | `-Domain`, `-User`, `-SecurityDomain`, `-PasswordVar`, `-Pmrep` | Verbindung wie beim Backup |
 | `-b VERZ` | `-BackupDir` | Backup-Basisverzeichnis |
 | `-L LAUF` | `-Run` | Backup-Lauf (Name oder Pfad); Standard: `LATEST_SUCCESS` |
+| `--with-incrementals` | `-WithIncrementals` | neuere inkrementelle Laeufe ueberlagern: je Datei die neueste Version, Control-Files zusammengefuehrt; fehlgeschlagene inkrementelle Laeufe werden mit Warnung uebersprungen |
 | `-F A,B` | `-Folders` | nur diese Folder |
 | `-O REGEX` | `-ObjectFilter` | nur Dateien, deren Pfad passt |
 | `--dtd DATEI` | `-Dtd` | `impcntl.dtd` (Standard: neben pmrep bzw. `$INFA_HOME/server/bin`) |

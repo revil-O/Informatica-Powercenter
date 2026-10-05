@@ -30,6 +30,8 @@ Quelle und Umfang:
   -L LAUF             Backup-Lauf (Verzeichnisname oder Pfad; Standard: Inhalt von LATEST_SUCCESS)
   -F A,B              nur diese Folder
   -O REGEX            nur Dateien, deren Pfad passt (z.B. 'DWH/06_mapping/m_load_sales')
+  --with-incrementals neuere inkrementelle Laeufe (folder_backup --incremental) ueber den Lauf legen:
+                      je Datei wird die neueste Version importiert
   --dtd DATEI         impcntl.dtd (Standard: neben pmrep bzw. $INFA_HOME/server/bin)
 
 Ausfuehrung:
@@ -50,7 +52,7 @@ EOF
 ### ---------------------------------------------------------------- Parameter
 REPO=""; DOMAIN=""; REPUSER=""; SECDOMAIN=""; PASSVAR="INFA_PASSWORD"; PMREP=""
 BASEDIR="./infa_backup"; RUN=""; FOLDERS=""; OBJ_RE=""; DTD=""; WORKDIR=""; CONFIG=""
-CREATE_FOLDERS=0; CHECKIN=""; VALIDATE=0; VERIFY=1; FAIL_FAST=0; MAX_ERRORS=0; EXECUTE=0; ASSUME_YES=0
+WITH_INC=0; CREATE_FOLDERS=0; CHECKIN=""; VALIDATE=0; VERIFY=1; FAIL_FAST=0; MAX_ERRORS=0; EXECUTE=0; ASSUME_YES=0
 
 load_config() {  # gleiche Datei wie folder_backup; backup-spezifische Schluessel werden ignoriert
   local key val
@@ -83,6 +85,7 @@ while [ $# -gt 0 ]; do
     -w) WORKDIR="$2"; shift 2 ;;
     --dtd) DTD="$2"; shift 2 ;;
     --create-folders) CREATE_FOLDERS=1; shift ;;
+    --with-incrementals) WITH_INC=1; shift ;;
     --checkin) CHECKIN="$2"; shift 2 ;;
     --validate) VALIDATE=1; shift ;;
     --no-verify) VERIFY=0; shift ;;
@@ -161,38 +164,71 @@ case "${BSTATUS:-?}" in
   *) warn "Backup-Lauf hat Status ${BSTATUS:-unbekannt} - Restore nur mit Vorsicht" ;;
 esac
 
+### ---------------------------------------------------------------- Laeufe: Basis + ggf. neuere inkrementelle Laeufe
+RUNS=("$RUNDIR")
+[ -f "$RUNDIR/INCREMENTAL" ] && warn "der gewaehlte Lauf ist inkrementell - er enthaelt nur geaenderte Objekte"
+if [ $WITH_INC -eq 1 ]; then
+  RPREFIX=$(basename "$RUNDIR" | sed -E 's/_[0-9]{8}_[0-9]{6}.*$//')
+  while IFS= read -r D; do
+    [ "$(basename "$D")" \> "$(basename "$RUNDIR")" ] || continue
+    [ -f "$D/INCREMENTAL" ] || continue
+    if [ -f "$D/RUNNING" ]; then
+      warn "inkrementeller Lauf $(basename "$D") laeuft noch oder wurde abgebrochen - wird uebersprungen"
+    elif { [ -f "$D/SUCCESS" ] || [ -f "$D/PARTIAL" ]; } && [ -f "$D/import_order.txt" ]; then
+      RUNS+=("$D"); log "[INFO] - inkrementeller Lauf einbezogen: $(basename "$D")"
+    else
+      warn "inkrementeller Lauf $(basename "$D") ist fehlgeschlagen - wird uebersprungen"
+    fi
+  done < <(find "$BASEDIR" -maxdepth 1 -type d -name "${RPREFIX}_*_inc*" 2>/dev/null | sort)
+  [ ${#RUNS[@]} -eq 1 ] && log "[INFO] - keine neueren inkrementellen Laeufe gefunden"
+fi
+
 ### ---------------------------------------------------------------- Auswahl
+# ALLORD: "laufindex|folder|datei|ctrl" aus allen Laeufen; je Datei gewinnt der neueste Lauf.
+# Reihenfolge: Folder wie im Basislauf (Shared zuerst), neue Folder dahinter; im Folder nach Typ-Praefix.
+ALLORD="$WORKDIR/all_order.txt"; : > "$ALLORD"
+for i in "${!RUNS[@]}"; do awk -v i="$i" 'NF { print i "|" $0 }' "${RUNS[$i]}/import_order.txt" >> "$ALLORD"; done
 SEL="$WORKDIR/selection.txt"
-awk -F'|' -v flist="$FOLDERS" 'BEGIN { n=split(flist, a, ","); for (i=1;i<=n;i++) { gsub(/^[ \t]+|[ \t]+$/,"",a[i]); if (a[i]!="") want[a[i]]=1 } }
-  NF>=3 && (n==0 || ($1 in want))' "$RUNDIR/import_order.txt" > "$SEL"
-if [ -n "$OBJ_RE" ]; then grep -E "^[^|]*\|[^|]*($OBJ_RE)" "$SEL" > "$SEL.tmp"; mv "$SEL.tmp" "$SEL"; fi
+awk -F'|' -v flist="$FOLDERS" '
+  BEGIN { n=split(flist, a, ","); for (i=1;i<=n;i++) { gsub(/^[ \t]+|[ \t]+$/,"",a[i]); if (a[i]!="") want[a[i]]=1 } }
+  NF>=4 && (n==0 || ($2 in want)) { if (!($2 in fo)) fo[$2]=++nf; line[$3]=$0; fol[$3]=$2 }
+  END { for (r in line) printf "%06d\t%s\t%s\n", fo[fol[r]], r, line[r] }' "$ALLORD" | sort -t"$(printf '\t')" -k1,1 -k2,2 | cut -f3 > "$SEL"
+if [ -n "$OBJ_RE" ]; then grep -E "^[^|]*\|[^|]*\|[^|]*($OBJ_RE)" "$SEL" > "$SEL.tmp"; mv "$SEL.tmp" "$SEL"; fi
 if [ -n "$FOLDERS" ]; then
   IFS=',' read -ra _F <<< "$FOLDERS"
   for f in "${_F[@]}"; do
     f="${f#"${f%%[![:space:]]*}"}"; f="${f%"${f##*[![:space:]]}"}"
-    grep -q "^$(printf '%s' "$f" | sed 's/[][\.*^$|+?(){}]/\\&/g')|" "$RUNDIR/import_order.txt" || record_error "Folder $f ist nicht im Backup-Lauf"
+    cut -d'|' -f2 "$ALLORD" | grep -qxF "$f" || record_error "Folder $f ist nicht im Backup-Lauf"
   done
 fi
 [ -s "$SEL" ] || { log "[FEHLER] - keine Dateien ausgewaehlt"; exit 2; }
-log "[INFO] - $(wc -l < "$SEL" | tr -d ' ') Datei(en) in $(cut -d'|' -f1 "$SEL" | sort -u | wc -l | tr -d ' ') Folder(n) ausgewaehlt"
+log "[INFO] - $(wc -l < "$SEL" | tr -d ' ') Datei(en) in $(cut -d'|' -f2 "$SEL" | sort -u | wc -l | tr -d ' ') Folder(n) ausgewaehlt$([ ${#RUNS[@]} -gt 1 ] && echo ", davon $(grep -vc '^0|' "$SEL") aus inkrementellen Laeufen")"
 
 ### ---------------------------------------------------------------- Dateien bereitstellen und pruefen
-# Folder-Verzeichnis oder Archiv (.tar.gz) ins Arbeitsverzeichnis uebernehmen
-declare -A PREPARED=()
-prepare_folder() {  # $1=sicherer Foldername
-  [ -n "${PREPARED[$1]:-}" ] && return "${PREPARED[$1]}"
-  if [ -d "$RUNDIR/$1" ]; then
-    mkdir -p "$WORKDIR/src/$1" && cp "$RUNDIR/$1/import_ctrl.xml" "$WORKDIR/src/$1/" 2>/dev/null
-  elif [ -f "$RUNDIR/$1.tar.gz" ]; then
-    tar xzf "$RUNDIR/$1.tar.gz" -C "$WORKDIR/src" 2>> "$WORKDIR/log/extract.txt" || { PREPARED[$1]=1; return 1; }
-  else
-    PREPARED[$1]=1; return 1
+# Folder eines Laufs bereitstellen: Verzeichnis direkt, Archiv (.tar.gz/.zip) ins Arbeitsverzeichnis auspacken
+declare -A PBASE=()
+prepare_folder() {  # $1=laufindex $2=sicherer Foldername -> Basisverzeichnis in PBASE
+  local k="$1|$2" run="${RUNS[$1]}" x="$WORKDIR/extract/$1"
+  [ -n "${PBASE[$k]:-}" ] && { [ "${PBASE[$k]}" != "FEHLT" ]; return; }
+  if [ -d "$run/$2" ]; then PBASE[$k]="$run"
+  elif [ -f "$run/$2.tar.gz" ] && mkdir -p "$x" && tar xzf "$run/$2.tar.gz" -C "$x" 2>> "$WORKDIR/log/extract.txt"; then PBASE[$k]="$x"
+  elif [ -f "$run/$2.zip" ] && command -v unzip >/dev/null 2>&1 && mkdir -p "$x" && unzip -qo "$run/$2.zip" -d "$x" 2>> "$WORKDIR/log/extract.txt"; then PBASE[$k]="$x"
+  else PBASE[$k]="FEHLT"; return 1
   fi
-  PREPARED[$1]=0; return 0
 }
 
 xml_esc()  { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/"/\&quot;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 sed_repl() { printf '%s' "$1" | sed -e 's/[\\|&]/\\&/g'; }   # fuer die Ersetzung in sed "s|...|...|"
+
+# Control-Files zusammenfuehren: FOLDERMAP- und SPECIFICOBJECT-Zeilen aus $1 in $2 ergaenzen -> stdout
+merge_ctrl() {  # $1=zusatz $2=basis
+  awk 'NR==FNR { if ($0 ~ /<FOLDERMAP /) fm[++a]=$0; else if ($0 ~ /<SPECIFICOBJECT /) so[++b]=$0; next }
+       { base[++m]=$0; seen[$0]=1 }
+       END { for (i=1;i<=m;i++) { l=base[i]
+               if (l ~ /<RESOLVECONFLICT>/) for (j=1;j<=a;j++) if (!(fm[j] in seen)) { print fm[j]; seen[fm[j]]=1 }
+               if (l ~ /<TYPEOBJECT /)      for (j=1;j<=b;j++) if (!(so[j] in seen)) { print so[j]; seen[so[j]]=1 }
+               print l } }' "$1" "$2"
+}
 
 # Control-File anpassen: Ziel-Repository, ggf. Check-in
 prepare_ctrl() {  # $1=ctrl-Datei im Arbeitsverzeichnis
@@ -207,30 +243,41 @@ prepare_ctrl() {  # $1=ctrl-Datei im Arbeitsverzeichnis
 }
 
 ITEMS="$WORKDIR/items.txt"; : > "$ITEMS"
-declare -A CTRL_DONE=() FOLDER_SHARED=()
-while IFS='|' read -r F REL CTRL; do
-  SF="${REL%%/*}"
-  if ! prepare_folder "$SF"; then record_error "$F: weder Verzeichnis noch Archiv $SF.tar.gz im Backup-Lauf"; continue; fi
-  if [ -d "$RUNDIR/$SF" ]; then
-    mkdir -p "$(dirname "$WORKDIR/src/$REL")"
-    cp "$RUNDIR/$REL" "$WORKDIR/src/$REL" 2>/dev/null || { record_error "$F: $REL fehlt im Backup-Lauf"; continue; }
-  fi
-  [ -f "$WORKDIR/src/$REL" ] || { record_error "$F: $REL fehlt im Backup-Lauf"; continue; }
+declare -A CTRL_SRC=() FOLDER_SHARED=()
+while IFS='|' read -r IX F REL CTRL; do
+  SF="${REL%%/*}"; RUNI="${RUNS[$IX]}"
+  if ! prepare_folder "$IX" "$SF"; then record_error "$F: weder Verzeichnis noch Archiv $SF.tar.gz/.zip in $(basename "$RUNI")"; continue; fi
+  SRCB="${PBASE[$IX|$SF]}"
+  mkdir -p "$(dirname "$WORKDIR/src/$REL")"
+  cp "$SRCB/$REL" "$WORKDIR/src/$REL" 2>/dev/null || { record_error "$F: $REL fehlt in $(basename "$RUNI")"; continue; }
   if [ $VERIFY -eq 1 ]; then
-    EXP=$(awk -F';' -v d="$REL" '$4==d {print $6; exit}' "$RUNDIR/manifest.csv")
+    EXP=$(awk -F';' -v d="$REL" '$4==d {print $6; exit}' "$RUNI/manifest.csv")
     if [ -n "$EXP" ] && [ "$EXP" != "-" ] && [ "$(checksum "$WORKDIR/src/$REL")" != "$EXP" ]; then
-      record_error "$F: $REL - Pruefsumme stimmt nicht mit manifest.csv ueberein, wird nicht importiert"; continue
+      record_error "$F: $REL - Pruefsumme stimmt nicht mit manifest.csv ($(basename "$RUNI")) ueberein, wird nicht importiert"; continue
     fi
   fi
-  if [ -z "${CTRL_DONE[$CTRL]:-}" ]; then
-    [ -f "$WORKDIR/src/$CTRL" ] || { record_error "$F: Control-File $CTRL fehlt"; continue; }
-    prepare_ctrl "$WORKDIR/src/$CTRL"; CTRL_DONE[$CTRL]=1
-  fi
+  # Control-File-Quellen je Folder sammeln (alle beteiligten Laeufe)
+  case " ${CTRL_SRC[$CTRL]:-} " in *" $SRCB/$CTRL "*) ;; *) CTRL_SRC[$CTRL]="${CTRL_SRC[$CTRL]:-} $SRCB/$CTRL" ;; esac
   if [ -z "${FOLDER_SHARED[$F]:-}" ]; then
     grep -q '<FOLDER [^>]*SHARED *= *"SHARED"' "$WORKDIR/src/$REL" && FOLDER_SHARED[$F]=1 || FOLDER_SHARED[$F]=0
   fi
-  echo "$F|$REL|$CTRL" >> "$ITEMS"
+  echo "$F|$REL|$CTRL|$IX" >> "$ITEMS"
 done < "$SEL"
+
+# Control-Files: erstes als Basis, die weiteren zusammenfuehren, dann anpassen
+declare -A CTRL_BAD=()
+for CTRL in "${!CTRL_SRC[@]}"; do
+  read -ra SRCS <<< "${CTRL_SRC[$CTRL]}"
+  DST="$WORKDIR/src/$CTRL"; mkdir -p "$(dirname "$DST")"
+  if ! cp "${SRCS[0]}" "$DST" 2>/dev/null; then record_error "Control-File $CTRL fehlt"; CTRL_BAD[$CTRL]=1; continue; fi
+  for ((k=1; k<${#SRCS[@]}; k++)); do
+    [ -f "${SRCS[$k]}" ] && merge_ctrl "${SRCS[$k]}" "$DST" > "$DST.tmp" && mv "$DST.tmp" "$DST"
+  done
+  prepare_ctrl "$DST"
+done
+if [ ${#CTRL_BAD[@]} -gt 0 ]; then
+  awk -F'|' 'NR==FNR { bad[$0]=1; next } !($3 in bad)' <(printf '%s\n' "${!CTRL_BAD[@]}") "$ITEMS" > "$ITEMS.tmp" && mv "$ITEMS.tmp" "$ITEMS"
+fi
 
 ### ---------------------------------------------------------------- Verbindung, Ziel-Folder
 PW_PLAIN=""
@@ -272,7 +319,7 @@ done < <(printf '%s\n' "${FOLDER_ORDER[@]}")
       echo "# FEHLT: Folder $F existiert im Ziel nicht (--create-folders) - seine Dateien werden uebersprungen"
     fi
   done
-  while IFS='|' read -r F REL CTRL; do
+  while IFS='|' read -r F REL CTRL _; do
     echo "\"$PMREP\" objectimport -i \"$WORKDIR/src/$REL\" -c \"$WORKDIR/src/$CTRL\""
   done < "$ITEMS"
 } > "$PLAN"
@@ -305,7 +352,7 @@ done
 
 N_OK=0; N_IMP=0
 VALIDATE_LIST="$WORKDIR/validate.txt"; : > "$VALIDATE_LIST"
-while IFS='|' read -r F REL CTRL; do
+while IFS='|' read -r F REL CTRL IX; do
   if [ -n "${MISSING[$F]:-}" ]; then echo "$F;$REL;UEBERSPRUNGEN;;Folder fehlt im Ziel" >> "$REPORT"; continue; fi
   N_IMP=$((N_IMP+1))
   LOGF="$WORKDIR/log/import_$(safe "$REL").log"; OUTF="$WORKDIR/log/import_$(safe "$REL").out"
@@ -331,7 +378,7 @@ while IFS='|' read -r F REL CTRL; do
     echo "$F;$REL;OK;;" >> "$REPORT"
   fi
   N_OK=$((N_OK+1))
-  awk -F';' -v d="$REL" '$4==d {print $1 "|" $2 "|" $3 "|" d; exit}' "$RUNDIR/manifest.csv" >> "$VALIDATE_LIST"
+  awk -F';' -v d="$REL" '$4==d {print $1 "|" $2 "|" $3 "|" d; exit}' "${RUNS[$IX]}/manifest.csv" >> "$VALIDATE_LIST"
 done < "$ITEMS"
 
 ### ---------------------------------------------------------------- Validierung

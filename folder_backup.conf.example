@@ -42,3 +42,12 @@ ZIP=0
 GIT_REPO=
 #GIT_AUTHOR=Informatica Backup <infa-backup@firma.de>
 GIT_PUSH=0
+
+# --- Inkrementell (optional, siehe docs/FOLDER_BACKUP.md)
+# gespeicherte Repository-Query, z.B. "Last saved time within last 2 days"; leer = Vollsicherung
+# (fuer den taeglichen Lauf besser per Kommandozeile: --incremental Q_CHANGED_2D)
+INCR_QUERY=
+QUERY_TYPE=shared
+
+# --- Ergaenzende Sicherungen in _repository/ (Connections ohne Passwoerter, Folder, Checkouts, Labels, ...)
+EXTRAS=1
