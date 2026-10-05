@@ -36,7 +36,7 @@ Ablauf:
 3. `pmrep listobjectdependencies -p parents` fuer verwaiste Shortcuts
 4. Aktionen:
    - `LOESCHEN` - verwaist, von nichts verwendet, Typ source/target/mapplet (`pmrep deleteobject`)
-   - `REIMPORT` - verwaist, aber noch verwendet: gestufter Ablauf in `reimport_plan.txt` (Verwender sichern, Verwender und Shortcut loeschen, Re-Import) - wird nie automatisch ausgefuehrt
+   - `REIMPORT` - verwaist, aber noch verwendet: gestufter Ablauf in `reimport_plan.txt` (Verwender sichern, Verwender und Shortcut loeschen, Re-Import) - wird nie automatisch ausgefuehrt - Anleitung: [docs/REIMPORT.md](docs/REIMPORT.md)
    - `MANUELL_PRUEFEN` - Referenz-Ordner nicht lesbar, Abhaengigkeiten unbekannt, Transformation (Designer) oder Export fehlgeschlagen (`--include-suspect` / `-IncludeSuspect`)
    - `UMBENENNEN_IM_DESIGNER` - gueltiges Duplikat `X1` zu verwaistem `X`, das geloescht wird; pmrep kann nicht umbenennen
    - `NACH_BASIS_PRUEFEN` - Duplikat `X1`, dessen Original `X` noch nicht geloescht werden kann - erst `X` klaeren
