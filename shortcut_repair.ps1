@@ -28,7 +28,7 @@ param(
   [Parameter(Mandatory = $true)][string]$Folder,
   [string]$SecurityDomain,
   [string[]]$SharedFolder = @(),                  # Shared Folder fuer das Control-File (Standard: aus den Shortcuts)
-  [string]$SourceRepository,                      # Quell-Repository fuer das Control-File (Standard: Repository)
+  [string]$SourceRepository,                      # Quell-Repository fuer das Control-File (Standard: Repository; bei -NoConnect Pflicht, falls Repository fehlt)
   [string[]]$Types = @('source', 'target', 'mapplet', 'transformation'),
   [string]$ObjectFile,                            # Objektliste statt listobjects; Zeilen: typ|name[|subtyp]
   [string]$Pmrep,                                 # Pfad zu pmrep(.exe)
@@ -43,6 +43,9 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $NoConnect -and (-not $Repository -or -not $Domain -or -not $User)) {
   throw 'Repository, Domain und User sind Pflicht (oder -NoConnect fuer eine bestehende Verbindung).'
+}
+if (-not $Repository -and -not $SourceRepository) {
+  throw 'Repository-Name fehlt: -Repository (oder bei -NoConnect mindestens -SourceRepository) angeben - wird fuer das Control-File gebraucht.'
 }
 if (-not $SourceRepository) { $SourceRepository = $Repository }
 # "-Types source,target" kommt je nach Aufruf (powershell -File) als ein String an
@@ -74,6 +77,8 @@ $CtrlFile = Join-Path $OutDir 'ctrl_reimport.xml'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # eigene Verbindungsdatei, damit kein fremdes pmrep.cnx ueberschrieben wird
+$prevCnxInfo = $env:INFA_REPCNX_INFO
+$createdPassword = $false
 if (-not $NoConnect) { $env:INFA_REPCNX_INFO = Join-Path $OutDir 'pmrep.cnx' }
 
 function Write-Log([string]$Text) {
@@ -146,11 +151,21 @@ try {
   if (-not $NoConnect) {
     if (-not $env:INFA_PASSWORD) {
       $sec = Read-Host -AsSecureString ("Passwort fuer {0}" -f $User)
-      $env:INFA_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+      $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+      try {
+        $env:INFA_PASSWORD = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $createdPassword = $true
+      } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        $sec.Dispose()
+      }
     }
     $conn = @('connect', '-r', $Repository, '-d', $Domain, '-n', $User, '-X', 'INFA_PASSWORD')
     if ($SecurityDomain) { $conn += @('-s', $SecurityDomain) }
-    if (-not (Invoke-Pmrep $conn (Join-Path $LogDir 'connect.txt'))) {
+    $connected = Invoke-Pmrep $conn (Join-Path $LogDir 'connect.txt')
+    # selbst abgefragtes Passwort sofort wieder entfernen (nur fuer connect noetig)
+    if ($createdPassword) { Remove-Item Env:INFA_PASSWORD -ErrorAction SilentlyContinue; $createdPassword = $false }
+    if (-not $connected) {
       Write-Log ("[FEHLER] - Verbindung fehlgeschlagen, siehe {0}" -f (Join-Path $LogDir 'connect.txt'))
       exit 1
     }
@@ -210,7 +225,9 @@ try {
         if ($null -eq $l) { $refCache[$key] = $null }
         else { $refCache[$key] = @($l | ForEach-Object { Get-ShortName $o.Type $_.Name }) }
       }
-      if ($null -eq $refCache[$key] -or -not ($refCache[$key] -contains $entry.RefName)) { $entry.Status = 'ORPHAN' }
+      # ORPHAN nur, wenn die Liste des Referenz-Ordners gelesen werden konnte und das Objekt fehlt
+      if ($null -eq $refCache[$key]) { $entry.Status = 'REF_CHECK_FAILED' }
+      elseif (-not ($refCache[$key] -contains $entry.RefName)) { $entry.Status = 'ORPHAN' }
     }
     $analysis += $entry
   }
@@ -227,37 +244,89 @@ try {
   }
 
   $deletable = @('source', 'target', 'mapplet')
-  $rows = @(); $deletes = @(); $renames = @(); $plan = @()
-  $nDel = 0; $nMan = 0; $nRen = 0; $nOk = 0
+  $deletes = @(); $renames = @(); $plan = @(); $reimport = @()
+  $nDel = 0; $nMan = 0; $nRen = 0; $nOk = 0; $nReimp = 0
+  $act = @{}; $par = @{}; $hnt = @{}
+  $ReimportFile = Join-Path $OutDir 'reimport_plan.txt'
+
+  # Eltern-Objekte aus dem deps-Log: Objekte mit Type/Name
+  function Get-ParentList([string]$Type, [string]$Name) {
+    $f = Join-Path $LogDir ("deps_{0}_{1}.txt" -f $Type, (Get-SafeName $Name))
+    if (-not (Test-Path $f)) { return @() }
+    $res = @()
+    foreach ($line in Get-Content $f) {
+      $tok = @($line.Trim() -split '\s+' | Where-Object { $_ })
+      if ($tok.Count -lt 2 -or $tok[0].ToLower() -notmatch '^(mapping|mapplet|session|worklet|workflow|transformation|target|source|task)$') { continue }
+      $n = @($tok[1..($tok.Count - 1)] | Where-Object { $_ -ne 'reusable' -and $_ -ne 'non-reusable' })
+      if ($n.Count -gt 0) { $res += [pscustomobject]@{ Type = $tok[0].ToLower(); Name = $n[0] } }
+    }
+    return , $res
+  }
+
+  # gestufter Ablauf (Variante A) fuer einen verwaisten Shortcut, der noch verwendet wird - wird nie automatisch ausgefuehrt
+  function Get-ReimportBlock($e, $count) {
+    $pl = Get-ParentList $e.Type $e.Name
+    $b = @("### $($e.Type) $($e.Name) - verwaist, verwendet von $count Objekt(en)", '# 1. Verwender sichern')
+    foreach ($p in $pl) { $b += ('& "{0}" objectexport -o {1} -f "{2}" -n "{3}" -m -s -b -r -u "backup_{1}_{4}.xml"' -f $Pmrep, $p.Type, $Folder, $p.Name, (Get-SafeName $p.Name)) }
+    $b += '# 2. Verwender loeschen, danach den verwaisten Shortcut'
+    $b += '#    (Sessions/Workflows, die diese Mappings nutzen, muessen im Import-XML aus Schritt 3 enthalten sein)'
+    foreach ($p in $pl) {
+      if ($p.Type -eq 'mapping' -or $p.Type -eq 'mapplet') { $b += ('& "{0}" deleteobject -o {1} -f "{2}" -n "{3}"' -f $Pmrep, $p.Type, $Folder, $p.Name) }
+      else { $b += "#   $($p.Type) $($p.Name): wird ueber den Re-Import ersetzt" }
+    }
+    if ($deletable -contains $e.Type) { $b += ('& "{0}" deleteobject -o {1} -f "{2}" -n "{3}"' -f $Pmrep, $e.Type, $Folder, $e.Name) }
+    else { $b += "# Designer: $($e.Type) $($e.Name) loeschen (pmrep deleteobject unterstuetzt Typ $($e.Type) nicht)" }
+    $b += '# 3. Re-Import aus dem Original-Export (Workflow-Ebene, exportiert mit -m -s -b -r)'
+    $b += ('& "{0}" objectimport -i "<ORIGINAL_EXPORT.xml>" -c "{1}"' -f $Pmrep, $CtrlFile)
+    $b += "# 4. ueberzaehlige Zahlen-Duplikate von $(Get-ShortName $e.Type $e.Name) loeschen, sobald unbenutzt; Mappings/Sessions validieren"
+    $b += ''
+    return $b
+  }
+
+  # Durchlauf 1: verwaiste / unklare Shortcuts bewerten
+  foreach ($e in $analysis | Where-Object { 'ORPHAN', 'EXPORT_FAILED', 'REF_CHECK_FAILED' -contains $_.Status }) {
+    $k = "$($e.Type)|$($e.Name)"
+    $p = Get-ParentCount $e.Type $e.Name $e.Sub; $par[$k] = "$p"
+    if ($e.Status -eq 'REF_CHECK_FAILED') {
+      $act[$k] = 'MANUELL_PRUEFEN'; $hnt[$k] = "Referenz-Ordner $($e.RefFolder) nicht lesbar (fehlt oder pmrep-Fehler) - siehe log/list_*"
+    } elseif ($e.Status -eq 'EXPORT_FAILED' -and -not $IncludeSuspect) {
+      $act[$k] = 'MANUELL_PRUEFEN'; $hnt[$k] = 'Export fehlgeschlagen - Shortcut-Status unbekannt (-IncludeSuspect zum Loeschen)'
+    } elseif ("$p" -eq '?') {
+      $act[$k] = 'MANUELL_PRUEFEN'; $hnt[$k] = 'Abhaengigkeiten nicht ermittelbar - siehe log/deps_*'
+    } elseif ([int]$p -gt 0) {
+      $act[$k] = 'REIMPORT'; $hnt[$k] = "wird noch von $p Objekt(en) verwendet - gestufter Ablauf in reimport_plan.txt"
+      $reimport += Get-ReimportBlock $e $p; $nReimp++
+    } elseif ($deletable -notcontains $e.Type) {
+      $act[$k] = 'MANUELL_PRUEFEN'; $hnt[$k] = "pmrep deleteobject unterstuetzt Typ $($e.Type) nicht - im Designer loeschen"
+    } else {
+      $act[$k] = 'LOESCHEN'
+      $deletes += $e
+      $plan += ('& "{0}" deleteobject -o {1} -f "{2}" -n "{3}"' -f $Pmrep, $e.Type, $Folder, $e.Name)
+      $nDel++
+    }
+    if ($act[$k] -eq 'MANUELL_PRUEFEN') { $nMan++ }
+  }
+
+  # Durchlauf 2: Report in Original-Reihenfolge, Duplikate einordnen
+  $rows = @()
   foreach ($e in $analysis) {
-    $parents = ''; $action = 'KEINE'; $hint = ''
+    $k = "$($e.Type)|$($e.Name)"
+    $action = 'KEINE'; if ($act.ContainsKey($k)) { $action = $act[$k] }
+    $parents = "$($par[$k])"; $hint = "$($hnt[$k])"
     if ($e.Status -eq 'OK' -or $e.Status -eq 'GLOBAL_UNCHECKED') {
       $nOk++
-      $base = Get-DupBase $e.Type $e.Name
-      if ($base -and ($seen["$($e.Type)|$base"] -eq 'ORPHAN' -or $seen["$($e.Type)|$base"] -eq 'EXPORT_FAILED')) {
+      if ($e.Name -match '^(.*[^0-9])([0-9]+)$') {
+        $base = $Matches[1]; $bact = $act["$($e.Type)|$base"]
         $from = Get-ShortName $e.Type $e.Name; $to = Get-ShortName $e.Type $base
-        $action = 'UMBENENNEN_IM_DESIGNER'
-        $hint = "nach Loeschen von $to umbenennen: $from -> $to"
-        $renames += "# Designer ($($e.Type)): $from in $to umbenennen (pmrep kann nicht umbenennen)"
-        $nRen++
+        if ($bact -eq 'LOESCHEN') {
+          $action = 'UMBENENNEN_IM_DESIGNER'; $hint = "nach Loeschen von $to umbenennen: $from -> $to"
+          $renames += "# Designer ($($e.Type)): $from in $to umbenennen (pmrep kann nicht umbenennen)"
+          $nRen++
+        } elseif ($bact) {
+          $action = 'NACH_BASIS_PRUEFEN'; $hint = "Duplikat von $to ($bact) - erst $to klaeren, dann $from loeschen oder umbenennen"
+          $nMan++
+        }
       }
-    } elseif ($e.Status -eq 'ORPHAN' -or $e.Status -eq 'EXPORT_FAILED') {
-      $parents = Get-ParentCount $e.Type $e.Name $e.Sub
-      if ($e.Status -eq 'EXPORT_FAILED' -and -not $IncludeSuspect) {
-        $action = 'MANUELL_PRUEFEN'; $hint = 'Export fehlgeschlagen - Shortcut-Status unbekannt (-IncludeSuspect zum Loeschen)'
-      } elseif ($deletable -notcontains $e.Type) {
-        $action = 'MANUELL_PRUEFEN'; $hint = "pmrep deleteobject unterstuetzt Typ $($e.Type) nicht - im Designer loeschen"
-      } elseif ("$parents" -eq '?') {
-        $action = 'MANUELL_PRUEFEN'; $hint = 'Abhaengigkeiten nicht ermittelbar - siehe log/deps_*'
-      } elseif ($parents -gt 0) {
-        $action = 'MANUELL_PRUEFEN'; $hint = "wird noch von $parents Objekt(en) verwendet - Mappings neu importieren (ctrl_reimport.xml)"
-      } else {
-        $action = 'LOESCHEN'
-        $deletes += $e
-        $plan += ('& "{0}" deleteobject -o {1} -f "{2}" -n "{3}"' -f $Pmrep, $e.Type, $Folder, $e.Name)
-        $nDel++
-      }
-      if ($action -eq 'MANUELL_PRUEFEN') { $nMan++ }
     }
     $rows += [pscustomobject]@{
       typ = $e.Type; name = $e.Name; subtyp = $e.Sub; status = $e.Status; ref_repository = $e.RefRepo
@@ -272,6 +341,7 @@ try {
     Set-Content -Path $Report -Value '"typ";"name";"subtyp";"status";"ref_repository";"ref_folder";"ref_objekt";"verwendet_von";"aktion";"hinweis"'
   }
   [IO.File]::WriteAllLines($PlanFile, [string[]]$plan, $Utf8NoBom)
+  if ($reimport.Count -gt 0) { [IO.File]::WriteAllLines($ReimportFile, [string[]]$reimport, $Utf8NoBom) }
 
   ### ------------------------------------------------------------ 4. Control-File fuer Re-Import (Variante A)
   $targetRepo = $Repository; if (-not $targetRepo) { $targetRepo = $SourceRepository }
@@ -285,13 +355,24 @@ try {
     $x += ('  <FOLDERMAP SOURCEFOLDERNAME="{0}" SOURCEREPOSITORYNAME="{1}" TARGETFOLDERNAME="{0}" TARGETREPOSITORYNAME="{2}"/>' -f
       (ConvertTo-XmlAttr $f), (ConvertTo-XmlAttr $SourceRepository), (ConvertTo-XmlAttr $targetRepo))
   }
+  # verwaiste Shortcuts duerfen beim Import nicht mehr existieren (REUSE wuerde sie behalten,
+  # REPLACE ist bei Shortcuts nicht moeglich) -> vorher loeschen, siehe plan.txt / reimport_plan.txt
+  foreach ($e in $analysis | Where-Object { 'ORPHAN', 'EXPORT_FAILED', 'REF_CHECK_FAILED' -contains $_.Status }) {
+    $x += ('  <!-- vor dem Import loeschen/klaeren: {0} {1} ({2}) -->' -f $e.Type, ($e.Name -replace '--', '- -'), $e.Status)
+  }
   $x += '  <RESOLVECONFLICT>'
-  # Shortcuts nie ersetzen, sondern wiederverwenden (Basisname, ohne Zahlen-Suffix-Duplikate)
-  foreach ($e in $analysis | Where-Object { $_.Status -ne 'EXPORT_FAILED' }) {
-    if (Get-DupBase $e.Type $e.Name) { continue }
-    $sn = Get-ShortName $e.Type $e.Name
+  # gueltige Shortcuts nie ersetzen, sondern wiederverwenden (ohne Zahlen-Suffix-Duplikate)
+  foreach ($e in $analysis | Where-Object { $_.Status -eq 'OK' -or $_.Status -eq 'GLOBAL_UNCHECKED' }) {
+    $name = $e.Name
+    $base = Get-DupBase $e.Type $e.Name
+    if ($base) {
+      # Duplikat: nur wenn es nach dem Loeschen des Originals auf den Basisnamen umbenannt wird
+      if ($act["$($e.Type)|$base"] -ne 'LOESCHEN') { continue }
+      $name = $base
+    }
+    $sn = Get-ShortName $e.Type $name
     $dbd = ''
-    if ($e.Type -eq 'source' -and $e.Name -ne $sn) { $dbd = ' DBDNAME="{0}"' -f (ConvertTo-XmlAttr $e.Name.Substring(0, $e.Name.IndexOf('.'))) }
+    if ($e.Type -eq 'source' -and $name -ne $sn) { $dbd = ' DBDNAME="{0}"' -f (ConvertTo-XmlAttr $name.Substring(0, $name.IndexOf('.'))) }
     $otn = $e.ObjSub; if (-not $otn) { $otn = $e.Type }
     $x += ('    <SPECIFICOBJECT NAME="{0}"{1} OBJECTTYPENAME="{2}" FOLDERNAME="{3}" REPOSITORYNAME="{4}" RESOLUTION="REUSE"/>' -f
       (ConvertTo-XmlAttr $sn), $dbd, (ConvertTo-XmlAttr $otn), (ConvertTo-XmlAttr $Folder), (ConvertTo-XmlAttr $SourceRepository))
@@ -301,10 +382,11 @@ try {
 
   ### ------------------------------------------------------------ 5. Zusammenfassung
   Write-Log ''
-  Write-Log ("[ERGEBNIS] - Shortcuts gueltig: {0} | zu loeschen: {1} | manuell pruefen: {2} | umbenennen (Designer): {3}" -f $nOk, $nDel, $nMan, $nRen)
+  Write-Log ("[ERGEBNIS] - Shortcuts gueltig: {0} | zu loeschen: {1} | Re-Import noetig: {2} | manuell pruefen: {3} | umbenennen (Designer): {4}" -f $nOk, $nDel, $nReimp, $nMan, $nRen)
   Write-Log "[ERGEBNIS] - Report:       $Report"
   Write-Log "[ERGEBNIS] - Plan:         $PlanFile"
   Write-Log "[ERGEBNIS] - Control-File: $CtrlFile"
+  if ($reimport.Count -gt 0) { Write-Log "[ERGEBNIS] - Re-Import:    $ReimportFile  (gestufter Ablauf, wird nie automatisch ausgefuehrt)" }
   if ($plan.Count -gt 0) { Write-Log ''; Write-Log '----- Plan -----'; $plan | ForEach-Object { Write-Log $_ }; Write-Log '----------------' }
 
   if (-not $Execute) {
@@ -337,4 +419,9 @@ try {
 }
 finally {
   if (-not $NoConnect -and $env:INFA_REPCNX_INFO -and (Test-Path $env:INFA_REPCNX_INFO)) { Remove-Item $env:INFA_REPCNX_INFO -Force }
+  # nur selbst gesetzte Umgebungswerte zuruecknehmen
+  if ($createdPassword) { Remove-Item Env:INFA_PASSWORD -ErrorAction SilentlyContinue }
+  if (-not $NoConnect) {
+    if ($null -eq $prevCnxInfo) { Remove-Item Env:INFA_REPCNX_INFO -ErrorAction SilentlyContinue } else { $env:INFA_REPCNX_INFO = $prevCnxInfo }
+  }
 }

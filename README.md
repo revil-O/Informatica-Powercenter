@@ -29,21 +29,27 @@ Ablauf:
 1. `pmrep listobjects` je Typ (source, target, mapplet, transformation) im Ordner
 2. `pmrep objectexport` je Objekt, `<SHORTCUT>`-Element auswerten; Referenz im Shared Folder pruefen
    - `OK` - Referenz vorhanden
-   - `ORPHAN` - kein Ordner/Objekt referenziert oder Referenz existiert nicht mehr
+   - `ORPHAN` - kein Ordner/Objekt referenziert, oder die Liste des Referenz-Ordners wurde gelesen und das Objekt fehlt
+   - `REF_CHECK_FAILED` - Referenz-Ordner nicht lesbar (fehlt, Berechtigung, pmrep-Fehler) - wird nie geloescht
    - `EXPORT_FAILED` - Export schlug fehl, Status unbekannt
    - `GLOBAL_UNCHECKED` - globaler Shortcut, nicht geprueft
 3. `pmrep listobjectdependencies -p parents` fuer verwaiste Shortcuts
 4. Aktionen:
    - `LOESCHEN` - verwaist, von nichts verwendet, Typ source/target/mapplet (`pmrep deleteobject`)
-   - `MANUELL_PRUEFEN` - noch verwendet (Mappings neu importieren), Transformation (Designer) oder Export fehlgeschlagen (`--include-suspect` / `-IncludeSuspect`)
-   - `UMBENENNEN_IM_DESIGNER` - gueltiges Duplikat `X1` zu verwaistem `X`; pmrep kann nicht umbenennen
+   - `REIMPORT` - verwaist, aber noch verwendet: gestufter Ablauf in `reimport_plan.txt` (Verwender sichern, Verwender und Shortcut loeschen, Re-Import) - wird nie automatisch ausgefuehrt
+   - `MANUELL_PRUEFEN` - Referenz-Ordner nicht lesbar, Abhaengigkeiten unbekannt, Transformation (Designer) oder Export fehlgeschlagen (`--include-suspect` / `-IncludeSuspect`)
+   - `UMBENENNEN_IM_DESIGNER` - gueltiges Duplikat `X1` zu verwaistem `X`, das geloescht wird; pmrep kann nicht umbenennen
+   - `NACH_BASIS_PRUEFEN` - Duplikat `X1`, dessen Original `X` noch nicht geloescht werden kann - erst `X` klaeren
 
-Ausgabe in `shortcut_repair_<Zeitstempel>/`: `report.csv` (Semikolon, Excel), `plan.txt`, `ctrl_reimport.xml`
-(Control-File fuer sauberen Re-Import: FOLDERMAP inkl. Shared Folder, `REUSE` fuer Shortcuts, `REPLACE` fuer den Rest),
+Ausgabe in `shortcut_repair_<Zeitstempel>/`: `report.csv` (Semikolon, Excel), `plan.txt`, `reimport_plan.txt`, `ctrl_reimport.xml`
+(Control-File fuer sauberen Re-Import: FOLDERMAP inkl. Shared Folder, `REUSE` nur fuer gueltige Shortcuts, `REPLACE` fuer den Rest;
+verwaiste Shortcuts sind als Kommentar aufgefuehrt und muessen vor dem Import geloescht sein - REUSE wuerde sie behalten, REPLACE geht bei Shortcuts nicht),
 `xml/` (Exporte, dienen auch als Sicherung), `log/` (alle pmrep-Ausgaben), `run.log`.
 
 Hinweise:
 - Vorher Repository-Backup (`pmrep backup`) ziehen.
+- `--no-connect` / `-NoConnect` nutzt eine bestehende pmrep-Verbindung; dann ist `-r`/`-R` bzw. `-Repository`/`-SourceRepository` trotzdem Pflicht (fuer das Control-File).
+- Ein interaktiv abgefragtes Passwort wird nur fuer `pmrep connect` gesetzt und danach sofort wieder entfernt.
 - Versioniertes Repository: geloeschte Objekte einchecken, ggf. `pmrep purgeversion`.
 - Das Parsing der `listobjects`-Ausgabe kann je nach PowerCenter-Version abweichen - erst Trockenlauf und `report.csv` pruefen.
   Notfalls Objektliste selbst vorgeben: `-L objekte.txt` / `-ObjectFile objekte.txt` (Zeilen `typ|name[|subtyp]`, Sources als `DBD.NAME`).
