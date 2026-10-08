@@ -1,6 +1,7 @@
 # SQL fuer das PowerCenter-Repository
 
-Abfragen direkt auf die Repository-Datenbank (nur lesend). Aufbau:
+Abfragen direkt auf die Repository-Datenbank (nur lesend) - auf Basis der **Repository-Tabellen**
+(`OPB_*` und `REP_*`-Tabellen wie `REP_FLD_DATATYPE`), nicht der MX-Views. Aufbau:
 
 ```
 sql/
@@ -10,8 +11,8 @@ sql/
 └── test/                           Test ohne Oracle (SQLite, nachgebautes Repository)
 ```
 
-> Repository-Tabellen (`OPB_*`) und MX-Views (`REP_*`) sind nur zum **Lesen** gedacht. Niemals per SQL aendern -
-> Aenderungen nur ueber die PowerCenter-Clients bzw. `pmrep`.
+> Die Repository-Tabellen sind nur zum **Lesen** gedacht. Niemals per SQL aendern - Aenderungen nur ueber die
+> PowerCenter-Clients bzw. `pmrep`.
 
 ## Port-Lineage (`oracle/port_lineage.sql`)
 
@@ -62,7 +63,8 @@ Ergebnisspalten: `FOLDER`, `MAPPING`, `PFAD_ID`, `SCHRITT`, `SCHRITTE`, `KANTE`,
    - Teil 1 vergleicht die vom Adapter erwarteten Spalten mit dem Data Dictionary. Alles `OK` -> weiter.
    - Bei `FEHLT` / `TABELLE/VIEW FEHLT` die Namen im Abschnitt **ADAPTER** von `port_lineage.sql` anpassen.
      Teil 2 listet dafuer die tatsaechlichen Spalten der Objekte.
-   - Teil 3c zeigt, wie das Attribut der Lookup-Bedingung heisst (erwartet: `Lookup condition...`).
+   - Teil 3c/3d zeigen Datentyp-Codes ohne Namen (erscheinen sonst als `Code n`), Teil 3e die Lookup-Attribute
+     (erwartet: `Lookup condition...`).
 2. **Parameter** im Block `params` von `port_lineage.sql` setzen:
 
    | Parameter | Bedeutung | Beispiel |
@@ -75,12 +77,12 @@ Ergebnisspalten: `FOLDER`, `MAPPING`, `PFAD_ID`, `SCHRITT`, `SCHRITTE`, `KANTE`,
    | `p_max_depth` | maximale Pfadlaenge | `60` |
 
 3. In SQL Developer / SQL*Plus als Repository-Owner (oder mit Leserecht auf die Tabellen) ausfuehren.
-   Voraussetzung: Oracle 11gR2 oder neuer (rekursive `WITH`-Klausel).
+   Voraussetzung: Oracle 11gR2 oder neuer (rekursive `WITH`-Klausel, `XMLAGG` fuer die Expressions).
 
 ### Aufbau
 
 ```
-params ─► ADAPTER (mp, inst, link, fld_trans, fld_src, fld_tgt, attr)   <- einzige Stelle mit Repository-Namen
+params ─► ADAPTER (mp, inst, link, expr, fld_trans, dtname, fld_src, fld_tgt, attr)  <- einzige Stelle mit Tabellennamen
        ─► port      alle Ports der Instanzen (Transformationen, Sources, Targets)
        ─► edge      Kanten LINK, EXPR, LKP_ARG, LKP_COND, LKP_CALL, GROUP (je Portpaar eine)
        ─► root      Ursprungsports (ausgehende, keine eingehende Kante)
@@ -89,17 +91,30 @@ params ─► ADAPTER (mp, inst, link, fld_trans, fld_src, fld_tgt, attr)   <- e
        ─► Ausgabe   je Pfad alle Schritte mit Port-Details
 ```
 
-Versionierte Repositories: verwendet wird jeweils die sichtbare bzw. hoechste Version von Mapping, Instanzen,
-Links und Ports.
+Verwendete Tabellen:
+
+| Tabelle | Inhalt |
+|---|---|
+| `OPB_SUBJECT`, `OPB_MAPPING` | Folder, Mappings/Mapplets (sichtbare Version) |
+| `OPB_WIDGET_INST`, `OPB_OBJECT_TYPE` | Instanzen im Mapping, Name des Objekttyps |
+| `OPB_WIDGET_DEP` | Port-Links zwischen Instanzen |
+| `OPB_WIDGET_FIELD`, `REP_FLD_DATATYPE` | Ports der Transformationen, Name des Datentyps |
+| `OPB_WIDGET_EXPR`, `OPB_EXPRESSION` | Expression je Ausgabeport (zeilenweise gespeichert, per `XMLAGG` zusammengesetzt) |
+| `OPB_SRC_FLD`, `OPB_TARG_FLD`, `OPB_MMD_DATATYPE` | Felder von Sources/Targets, Name des nativen Datentyps |
+| `OPB_WIDGET_ATTR`, `OPB_ATTR` | Transformations-Attribute mit Namen (Lookup-Bedingung) |
+
+Versionierte Repositories: Mapping in der sichtbaren Version (`IS_VISIBLE = 1`), Instanzen und Links in dieser
+Version; Ports, Expressions, Attribute und Source-/Target-Felder in der hoechsten Version je Objekt.
 
 ### Grenzen
 
-- **Spaltennamen:** Die Repository-Tabellen sind nicht oeffentlich dokumentiert, die MX-Views je Version leicht
-  unterschiedlich. Die Namen im Adapter stammen aus dem Repository Guide und verbreiteten Repository-Abfragen -
-  deshalb zuerst die Vorpruefung.
+- **Spaltennamen:** Die Repository-Tabellen sind nicht oeffentlich dokumentiert und koennen je Version abweichen.
+  Die Namen im Adapter stammen aus verbreiteten Repository-Abfragen - deshalb zuerst die Vorpruefung.
+  Am unsichersten: Praezision/Scale in `OPB_SRC_FLD`/`OPB_TARG_FLD` (`DPREC`/`DSCALE`) und die Zuordnung der
+  Datentyp-Codes (Teil 3c/3d der Vorpruefung).
 - **Expressions werden textuell ausgewertet:** ein Portname in einem String-Literal oder Kommentar erzeugt eine
-  ueberzaehlige `EXPR`-Kante. Die Expression stammt aus `REP_WIDGET_FIELD.EXPRESSION` (max. 2000 Zeichen) -
-  bei laengeren Expressions koennen Referenzen am Ende fehlen.
+  ueberzaehlige `EXPR`-Kante. Die Expression wird vollstaendig aus allen Zeilen von `OPB_EXPRESSION` zusammengesetzt
+  (CLOB, keine Laengengrenze); in der Ergebnisspalte `EXPRESSION` stehen die ersten 4000 Zeichen.
 - **`:LKP`-Argumente** werden nicht positionsgenau zugeordnet: alle Ports der aufrufenden Expression fuehren zu
   allen Eingabeports des Lookups. Ebenso fuehrt `LKP_CALL` von allen Ausgabeports des aufgerufenen Lookups.
 - **Router/Union/Normalizer** werden ueber den Portnamen ohne Ziffern am Ende verbunden; Ports wie `ADDR1`/`ADDR2`
@@ -118,7 +133,9 @@ Links und Ports.
 
 `test/` enthaelt ein in SQLite nachgebautes Repository mit dem Beispiel-Mapping `m_load_sales` (Source,
 Source Qualifier, Expression mit Variablenport und `:LKP`-Aufruf, verbundener Lookup, Router, Target).
-Die Oracle-Funktionen `REGEXP_LIKE`, `REGEXP_REPLACE` und `BITAND` werden in Python nachgebildet.
+Die Oracle-Funktionen `REGEXP_LIKE`, `REGEXP_REPLACE`, `BITAND` und `DBMS_LOB.SUBSTR` werden in Python
+nachgebildet, die `XMLAGG`-Verkettung durch `group_concat` ersetzt. Getestet werden u.a. eine Expression, die
+ueber zwei Zeilen von `OPB_EXPRESSION` verteilt ist, und aeltere Versionen, die nicht erscheinen duerfen.
 
 ```bash
 python3 sql/test/run_port_lineage.py                                  # alle Pfade + Soll/Ist-Pruefung

@@ -19,6 +19,9 @@
    Durchreichende Input/Output-Ports (SQ, Joiner, Aggregator, Sorter, Filter ...) sind derselbe
    Port und brauchen keine eigene Kante.
 
+   Datenbasis: ausschliesslich Repository-Tabellen (OPB_* und die Datentyp-Tabelle REP_FLD_DATATYPE),
+   keine MX-Views.
+
    Ausfuehren: Parameter im Block "params" setzen, als Repository-Owner (oder mit Leserecht auf die
    Repository-Tabellen) ausfuehren. Es wird nur gelesen.
    Vorher einmal sql/oracle/check_repository_columns.sql ausfuehren: weichen Spaltennamen in Ihrer
@@ -39,9 +42,10 @@ params AS (
 ),
 
 /* ===================================== ADAPTER =====================================================
-   Einzige Stelle mit Tabellen-/Spaltennamen des Repositorys. OPB_* = Repository-Tabellen,
-   REP_* = MX-Views. Bei abweichenden Namen (siehe check_repository_columns.sql) hier anpassen.
-   Versionierte Repositories: es wird jeweils die sichtbare (aktuelle) Version verwendet.
+   Einzige Stelle mit Tabellen-/Spaltennamen des Repositorys - nur Repository-Tabellen (OPB_*, REP_FLD_DATATYPE).
+   Bei abweichenden Namen (siehe check_repository_columns.sql) hier anpassen.
+   Versionierte Repositories: Mapping = sichtbare Version (IS_VISIBLE = 1), Instanzen/Links in dieser
+   Version; Ports, Expressions, Attribute, Source-/Target-Felder = hoechste Version je Objekt.
    ================================================================================================== */
 mp AS (                                   -- Mappings/Mapplets mit Folder
   SELECT s.SUBJ_NAME       AS folder_name,
@@ -75,43 +79,61 @@ link AS (                                 -- Port-Links zwischen Instanzen
   FROM OPB_WIDGET_DEP d
   JOIN mp ON mp.mapping_id = d.MAPPING_ID AND mp.map_version = d.VERSION_NUMBER
 ),
-fld_trans AS (                            -- Ports der Transformationen (Datentyp als Name, Expression)
+expr AS (                                 -- Expression je Ausgabeport; OPB_EXPRESSION speichert sie zeilenweise
+  SELECT we.WIDGET_ID       AS widget_id,
+         we.OUTPUT_FIELD_ID AS field_id,
+         /*EXPR_AGG*/ DBMS_XMLGEN.CONVERT(XMLAGG(XMLELEMENT(x, e.EXPRESSION) ORDER BY e.LINE_NO).EXTRACT('//text()').getClobVal(), 1) AS expression
+  FROM OPB_WIDGET_EXPR we
+  JOIN OPB_EXPRESSION e ON e.WIDGET_ID = we.WIDGET_ID AND e.EXPR_ID = we.EXPR_ID AND e.VERSION_NUMBER = we.VERSION_NUMBER
+  WHERE we.VERSION_NUMBER = (SELECT MAX(w2.VERSION_NUMBER) FROM OPB_WIDGET_EXPR w2 WHERE w2.WIDGET_ID = we.WIDGET_ID)
+  GROUP BY we.WIDGET_ID, we.OUTPUT_FIELD_ID
+),
+fld_trans AS (                            -- Ports der Transformationen
   SELECT f.WIDGET_ID  AS widget_id,
          f.FIELD_ID   AS field_id,
          f.FIELD_NAME AS port_name,
-         f.DATATYPE   AS datatype,
+         COALESCE(dt.DTYPE_NAME, 'Code ' || f.WGT_DATATYPE) AS datatype,
          f.WGT_PREC   AS prec,
          f.WGT_SCALE  AS scale,
          f.PORTTYPE   AS porttype,        -- Bitmaske: 1 Input, 2 Output, 8 Lookup, 32 Variable
-         f.EXPRESSION AS expression
-  FROM REP_WIDGET_FIELD f
-  WHERE f.VERSION_NUMBER = (SELECT MAX(f2.VERSION_NUMBER) FROM REP_WIDGET_FIELD f2 WHERE f2.WIDGET_ID = f.WIDGET_ID)
+         x.expression AS expression
+  FROM OPB_WIDGET_FIELD f
+  LEFT JOIN REP_FLD_DATATYPE dt ON dt.DTYPE_NUM = f.WGT_DATATYPE
+  LEFT JOIN expr x ON x.widget_id = f.WIDGET_ID AND x.field_id = f.FIELD_ID
+  WHERE f.VERSION_NUMBER = (SELECT MAX(f2.VERSION_NUMBER) FROM OPB_WIDGET_FIELD f2 WHERE f2.WIDGET_ID = f.WIDGET_ID)
+),
+dtname AS (                               -- Name eines nativen Datentyps (Sources/Targets)
+  SELECT NATIVE_DATATYPE AS ndtype, PM_DATATYPE AS dtype, MIN(DATATYPE_NAME) AS name
+  FROM OPB_MMD_DATATYPE
+  GROUP BY NATIVE_DATATYPE, PM_DATATYPE
 ),
 fld_src AS (                              -- Felder der Source-Definitionen
   SELECT sf.SRC_ID   AS widget_id,
          sf.FLDID    AS field_id,
          sf.SRC_NAME AS port_name,        -- in OPB_SRC_FLD heisst die Feldname-Spalte SRC_NAME
-         d.SOURCE_FIELD_DATATYPE  AS datatype,
-         d.SOURCE_FIELD_PRECISION AS prec,
-         d.SOURCE_FIELD_SCALE     AS scale
+         COALESCE(n.name, 'Code ' || sf.NDTYPE) AS datatype,
+         sf.DPREC    AS prec,
+         sf.DSCALE   AS scale
   FROM OPB_SRC_FLD sf
-  LEFT JOIN REP_ALL_SOURCE_FLDS d ON d.SOURCE_ID = sf.SRC_ID AND d.SOURCE_FIELD_NAME = sf.SRC_NAME
+  LEFT JOIN dtname n ON n.ndtype = sf.NDTYPE AND n.dtype = sf.DTYPE
   WHERE sf.VERSION_NUMBER = (SELECT MAX(s2.VERSION_NUMBER) FROM OPB_SRC_FLD s2 WHERE s2.SRC_ID = sf.SRC_ID)
 ),
 fld_tgt AS (                              -- Spalten der Target-Definitionen
   SELECT tf.TARGET_ID   AS widget_id,
          tf.FLDID       AS field_id,
          tf.TARGET_NAME AS port_name,     -- in OPB_TARG_FLD heisst die Spaltenname-Spalte TARGET_NAME
-         d.TARGET_FIELD_DATATYPE  AS datatype,
-         d.TARGET_FIELD_PRECISION AS prec,
-         d.TARGET_FIELD_SCALE     AS scale
+         COALESCE(n.name, 'Code ' || tf.NDTYPE) AS datatype,
+         tf.DPREC       AS prec,
+         tf.DSCALE      AS scale
   FROM OPB_TARG_FLD tf
-  LEFT JOIN REP_ALL_TARGET_FLDS d ON d.TARGET_ID = tf.TARGET_ID AND d.TARGET_FIELD_NAME = tf.TARGET_NAME
+  LEFT JOIN dtname n ON n.ndtype = tf.NDTYPE AND n.dtype = tf.DTYPE
   WHERE tf.VERSION_NUMBER = (SELECT MAX(t2.VERSION_NUMBER) FROM OPB_TARG_FLD t2 WHERE t2.TARGET_ID = tf.TARGET_ID)
 ),
-attr AS (                                 -- Transformations-Attribute (fuer die Lookup-Bedingung)
-  SELECT a.WIDGET_ID AS widget_id, a.ATTR_DESCRIPTION AS attr_name, a.ATTR_VALUE AS attr_value
-  FROM REP_WIDGET_ATTR a
+attr AS (                                 -- Transformations-Attribute mit Namen (fuer die Lookup-Bedingung)
+  SELECT a.WIDGET_ID AS widget_id, d.ATTR_NAME AS attr_name, a.ATTR_VALUE AS attr_value
+  FROM OPB_WIDGET_ATTR a
+  JOIN OPB_ATTR d ON d.ATTR_ID = a.ATTR_ID AND d.OBJECT_TYPE_ID = a.WIDGET_TYPE
+  WHERE a.VERSION_NUMBER = (SELECT MAX(a2.VERSION_NUMBER) FROM OPB_WIDGET_ATTR a2 WHERE a2.WIDGET_ID = a.WIDGET_ID)
 ),
 /* =================================== Ende ADAPTER ================================================= */
 
@@ -259,8 +281,9 @@ SELECT m.folder_name                                   AS folder,
          || CASE WHEN p.prec IS NOT NULL
                  THEN '(' || p.prec || CASE WHEN COALESCE(p.scale, 0) > 0 THEN ',' || p.scale ELSE '' END || ')'
                  ELSE '' END                           AS datentyp,
-       CASE WHEN p.expression IS NOT NULL AND UPPER(p.expression) <> UPPER(p.port_name)
-            THEN p.expression END                      AS expression,
+       CASE WHEN p.expression IS NOT NULL
+             AND UPPER(DBMS_LOB.SUBSTR(p.expression, 4000, 1)) <> UPPER(p.port_name)
+            THEN DBMS_LOB.SUBSTR(p.expression, 4000, 1) END AS expression,
        pa.pathtext                                     AS pfad
 FROM path pa
 JOIN walk w ON w.root_key = pa.root_key AND INSTR(pa.keypath, w.keypath) = 1
