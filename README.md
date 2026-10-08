@@ -1,6 +1,17 @@
 # Informatica-Powercenter
 Scripts &amp; useful things (administration) for data integration development using Informatica Powercenter
 
+## SQL fuer das Repository
+
+Abfragen direkt auf die Repository-Datenbank (nur lesend), siehe [sql/README.md](sql/README.md):
+
+- `sql/oracle/port_lineage.sql` - **Port-Lineage**: verfolgt jeden Port vom Ursprung (Source-Feld, Lookup, Konstante)
+  ueber alle Transformationen bis in die Target-Spalte, eine Zeile je Schritt mit Datentyp/Praezision/Scale.
+  Neben den Links werden auch logische Verbindungen in Expressions verfolgt (Port-Referenzen, Variablenports,
+  `:LKP`/`:SP`-Aufrufe, Lookup-Bedingungen, Router/Union/Normalizer-Gruppen).
+- `sql/oracle/check_repository_columns.sql` - Vorpruefung, ob Tabellen und Spalten zum Repository passen.
+- `sql/test/` - Test der Abfrage ohne Oracle gegen ein nachgebautes Repository (SQLite).
+
 ## folder_backup / folder_restore (sh + ps1)
 
 Folderweises Backup des Repositorys als importierbare XML-Exporte: erst die Shared Folder, danach alle anderen,
