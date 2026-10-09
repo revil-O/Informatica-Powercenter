@@ -7,6 +7,7 @@ Abfragen direkt auf die Repository-Datenbank (nur lesend) - auf Basis der **Repo
 sql/
 ├── oracle/                         Repository auf Oracle
 │   ├── check_repository_columns.sql    Vorpruefung: passen Tabellen/Spalten zum Adapter?
+│   ├── diag_io_waits.sql               Diagnose "db file sequential read" (Ziel-/Quelldatenbank, nicht Repository)
 │   └── port_lineage.sql                Port-Lineage Source -> Transformationen -> Target
 └── test/                           Test ohne Oracle (SQLite, nachgebautes Repository)
 ```
@@ -143,3 +144,14 @@ python3 sql/test/run_port_lineage.py end_port=T_CUSTOMER.FULL_NAME   # mit Param
 ```
 
 Nach Aenderungen an `port_lineage.sql` muss die Pruefung `OK` melden.
+
+## I/O-Diagnose (`oracle/diag_io_waits.sql`)
+
+Laeuft auf der **Quell- bzw. Zieldatenbank** der Sessions (nicht auf dem Repository), als DBA. Einzelne Abfragen
+markieren und ausfuehren; Erklaerung und Auswertung in [docs/TUNING.md](../docs/TUNING.md), Abschnitt 8.
+
+| Teil | Inhalt | Lizenz |
+|---|---|---|
+| A1 - A13 | V$-Views: Wait-Summen und -Verteilung, Latenz je Datei, Segmente, SQL, laufende `pmdtm`-Sessions, OS-Last, Parameter, Cache-Advice, Clustering Factor | keine |
+| B1 - B4 | AWR/ASH: Verlauf je Snapshot, Latenz je Datei, verursachende SQL, zeitgleiche Aktivitaet | **Diagnostics Pack** |
+| C | 10046-Trace einer Informatica-Session (Kommentar mit Anleitung) | keine |

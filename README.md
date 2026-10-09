@@ -11,7 +11,16 @@ siehe [sql/README.md](sql/README.md):
   Neben den Links werden auch logische Verbindungen in Expressions verfolgt (Port-Referenzen, Variablenports,
   `:LKP`/`:SP`-Aufrufe, Lookup-Bedingungen, Router/Union/Normalizer-Gruppen).
 - `sql/oracle/check_repository_columns.sql` - Vorpruefung, ob Tabellen und Spalten zum Repository passen.
+- `sql/oracle/diag_io_waits.sql` - Diagnose von Oracle-I/O-Waits (`db file sequential read`) der Ziel-/Quelldatenbank,
+  passend zu [docs/TUNING.md](docs/TUNING.md).
 - `sql/test/` - Test der Abfrage ohne Oracle gegen ein nachgebautes Repository (SQLite).
+
+## Performance-Tuning
+
+[docs/TUNING.md](docs/TUNING.md): Engpass einer Session finden (Thread-Statistik, Performance-Zaehler),
+Speicher und Caches (`pmdtm` nutzt nur einen Teil des RAMs, Auto-Memory-Grenzen), Windows/VM, Lookups,
+Partitionierung, Lesen und Schreiben nach Oracle sowie ausfuehrlich Oracle-Waits `db file sequential read`
+bis 2000+ ms: Diagnose, Infrastruktur-Ursachen, zu viele Reads, Datenbank-Parameter, Checkliste.
 
 ## folder_backup / folder_restore (sh + ps1)
 
