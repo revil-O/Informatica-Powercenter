@@ -25,7 +25,8 @@ Pflicht:
 Optional:
   -s SECDOMAIN      Security Domain (LDAP), falls benoetigt
   -S SHARED[,..]    Shared Folder fuer das Control-File (Standard: aus den Shortcuts ermittelt)
-  -R SRC_REPO       Quell-Repository-Name fuer das Control-File (Standard: REPO)
+  -R SRC_REPO       Quell-Repository-Name fuer das Control-File (Standard: REPO;
+                    bei --no-connect ist -r oder -R Pflicht)
   -t TYPEN          Objekttypen, kommagetrennt (Standard: source,target,mapplet,transformation)
   -L DATEI          Objektliste statt "pmrep listobjects"; Zeilen: typ|name[|subtyp]
   -P PFAD           Pfad zu pmrep (Standard: pmrep aus PATH bzw. $INFA_HOME/server/bin)
@@ -36,7 +37,8 @@ Optional:
   --yes             keine Rueckfrage bei --execute
   -h | --help       diese Hilfe
 
-Passwort: Umgebungsvariable INFA_PASSWORD, sonst interaktive Abfrage.
+Passwort: Umgebungsvariable INFA_PASSWORD mit dem pmpasswd-verschluesselten Passwort
+(pmrep connect -X), sonst interaktive Abfrage (pmrep connect -x).
 EOF
 }
 
@@ -69,6 +71,9 @@ done
 
 if [ -z "$FOLDER" ] || { [ $DO_CONNECT -eq 1 ] && { [ -z "$REPO" ] || [ -z "$DOMAIN" ] || [ -z "$REPUSER" ]; }; }; then
   usage; exit 2
+fi
+if [ -z "$REPO" ] && [ -z "$SRC_REPO" ]; then
+  echo "[FEHLER] - Repository-Name fehlt: -r (oder bei --no-connect mindestens -R) angeben - wird fuer das Control-File gebraucht"; exit 2
 fi
 [ -z "$SRC_REPO" ] && SRC_REPO="$REPO"
 
@@ -147,22 +152,30 @@ count_parents() {  # $1=typ $2=name $3=subtyp
 log "[SHORTCUT_REPAIR] - $(date '+%Y-%m-%d %H:%M:%S') - Modus: $([ $EXECUTE -eq 1 ] && echo AUSFUEHREN || echo TROCKENLAUF)"
 log "[INFO] - Repository=${REPO:-(bestehende Verbindung)} Folder=$FOLDER Typen=$TYPES Ausgabe=$OUTDIR"
 
+cleanup() { if [ $DO_CONNECT -eq 1 ]; then rm -f "$INFA_REPCNX_INFO"; fi; }
+trap cleanup EXIT
+
 if [ $DO_CONNECT -eq 1 ]; then
-  if [ -z "${INFA_PASSWORD:-}" ]; then
-    printf 'Passwort fuer %s: ' "$REPUSER"
-    stty -echo 2>/dev/null; read -r INFA_PASSWORD; stty echo 2>/dev/null; echo
-  fi
-  export INFA_PASSWORD
-  CONN=(connect -r "$REPO" -d "$DOMAIN" -n "$REPUSER" -X INFA_PASSWORD)
+  CONN=(connect -r "$REPO" -d "$DOMAIN" -n "$REPUSER")
   [ -n "$SECDOMAIN" ] && CONN+=(-s "$SECDOMAIN")
-  if ! "$PMREP" "${CONN[@]}" > "$OUTDIR/log/connect.txt" 2>&1; then
-    log "[FEHLER] - Verbindung fehlgeschlagen, siehe $OUTDIR/log/connect.txt"; exit 1
+  if [ -n "${INFA_PASSWORD:-}" ]; then
+    # -X erwartet das mit pmpasswd verschluesselte Passwort in der Umgebungsvariable
+    CONN+=(-X INFA_PASSWORD)
+    "$PMREP" "${CONN[@]}" > "$OUTDIR/log/connect.txt" 2>&1
+  else
+    printf 'Passwort fuer %s: ' "$REPUSER"
+    stty -echo 2>/dev/null; read -r PW_PLAIN; stty echo 2>/dev/null; echo
+    "$PMREP" "${CONN[@]}" -x "$PW_PLAIN" > "$OUTDIR/log/connect.txt" 2>&1
+  fi
+  RC=$?
+  PW_PLAIN=""
+  if [ $RC -ne 0 ]; then
+    log "[FEHLER] - Verbindung fehlgeschlagen, siehe $OUTDIR/log/connect.txt"
+    [ -n "${INFA_PASSWORD:-}" ] && log "[HINWEIS] - INFA_PASSWORD muss das mit pmpasswd verschluesselte Passwort enthalten (pmpasswd <passwort>)"
+    exit 1
   fi
   log "[STATUS] - verbunden mit $REPO"
 fi
-
-cleanup() { [ $DO_CONNECT -eq 1 ] && rm -f "$INFA_REPCNX_INFO"; }
-trap cleanup EXIT
 
 ### ---------------------------------------------------------------- 1. Objekte sammeln
 OBJLIST="$OUTDIR/objects.txt"
@@ -225,7 +238,10 @@ while IFS='|' read -r T NAME SUB; do
         REFCACHE[$KEY]="FAIL"
       fi
     fi
-    if [ "${REFCACHE[$KEY]}" = "FAIL" ] || ! grep -qixF "$RNAME" "${REFCACHE[$KEY]}"; then
+    # ORPHAN nur, wenn die Liste des Referenz-Ordners gelesen werden konnte und das Objekt fehlt
+    if [ "${REFCACHE[$KEY]}" = "FAIL" ]; then
+      STATUS="REF_CHECK_FAILED"
+    elif ! grep -qixF "$RNAME" "${REFCACHE[$KEY]}"; then
       STATUS="ORPHAN"
     fi
   fi
@@ -246,44 +262,90 @@ echo "typ;name;subtyp;status;ref_repository;ref_folder;ref_objekt;verwendet_von;
 : > "$PLAN"
 DELETES="$OUTDIR/deletes.txt"; : > "$DELETES"
 RENAMES="$OUTDIR/renames.txt"; : > "$RENAMES"
-n_del=0; n_man=0; n_ren=0; n_ok=0
+REIMPORT="$OUTDIR/reimport_plan.txt"; : > "$REIMPORT"
+n_del=0; n_man=0; n_ren=0; n_ok=0; n_reimp=0
+declare -A ACT PAR HNT  # "typ|name" -> Aktion / Anzahl Verwender / Hinweis
 
+# Eltern-Objekte aus dem deps-Log: Zeilen "typ name"
+parent_list() {  # $1=typ $2=name
+  awk 'tolower($1) ~ /^(mapping|mapplet|session|worklet|workflow|transformation|target|source|task)$/ {
+         for (i=2;i<=NF;i++) if ($i!="reusable" && $i!="non-reusable") { print tolower($1) " " $i; break } }' \
+      "$OUTDIR/log/deps_$1_$(safe "$2").txt" 2>/dev/null
+}
+
+# gestufter Ablauf (Variante A) fuer einen verwaisten Shortcut, der noch verwendet wird - wird nie automatisch ausgefuehrt
+write_reimport() {  # $1=typ $2=name $3=anzahl
+  local pt pn
+  {
+    echo "### $1 $2 - verwaist, verwendet von $3 Objekt(en)"
+    echo "# 1. Verwender sichern"
+    parent_list "$1" "$2" | while read -r pt pn; do
+      echo "\"$PMREP\" objectexport -o $pt -f \"$FOLDER\" -n \"$pn\" -m -s -b -r -u \"backup_${pt}_$(safe "$pn").xml\""
+    done
+    echo "# 2. Verwender loeschen, danach den verwaisten Shortcut"
+    echo "#    (Sessions/Workflows, die diese Mappings nutzen, muessen im Import-XML aus Schritt 3 enthalten sein)"
+    parent_list "$1" "$2" | while read -r pt pn; do
+      case "$pt" in
+        mapping|mapplet) echo "\"$PMREP\" deleteobject -o $pt -f \"$FOLDER\" -n \"$pn\"" ;;
+        *) echo "#   $pt $pn: wird ueber den Re-Import ersetzt" ;;
+      esac
+    done
+    if [[ "$DELETABLE" == *" $1 "* ]]; then
+      echo "\"$PMREP\" deleteobject -o $1 -f \"$FOLDER\" -n \"$2\""
+    else
+      echo "# Designer: $1 $2 loeschen (pmrep deleteobject unterstuetzt Typ $1 nicht)"
+    fi
+    echo "# 3. Re-Import aus dem Original-Export (Workflow-Ebene, exportiert mit -m -s -b -r)"
+    echo "\"$PMREP\" objectimport -i \"<ORIGINAL_EXPORT.xml>\" -c \"$CTRL\""
+    echo "# 4. ueberzaehlige Zahlen-Duplikate von $(short_name "$1" "$2") loeschen, sobald unbenutzt; Mappings/Sessions validieren"
+    echo
+  } >> "$REIMPORT"
+}
+
+# Durchlauf 1: verwaiste / unklare Shortcuts bewerten
 while IFS='|' read -r T NAME SUB STATUS RREPO RFOLDER RNAME RTYPE OSUB; do
-  PARENTS=""; ACTION="KEINE"; HINT=""
-  case "$STATUS" in
-    OK|GLOBAL_UNCHECKED)
-      n_ok=$((n_ok+1))
-      # Suffix-Duplikat? (Name = Basisname + Ziffern, Basisname ist verwaist)
-      if [[ "$NAME" =~ ^(.*[^0-9])([0-9]+)$ ]]; then
-        BASE="${BASH_REMATCH[1]}"
-        BSTAT="${SEEN[$T|$BASE]:-}"
-        if [ "$BSTAT" = "ORPHAN" ] || [ "$BSTAT" = "EXPORT_FAILED" ]; then
-          ACTION="UMBENENNEN_IM_DESIGNER"
-          HINT="nach Loeschen von $(short_name "$T" "$BASE") umbenennen: $(short_name "$T" "$NAME") -> $(short_name "$T" "$BASE")"
-          n_ren=$((n_ren+1))
-          echo "# Designer ($T): $(short_name "$T" "$NAME") in $(short_name "$T" "$BASE") umbenennen (pmrep kann nicht umbenennen)" >> "$RENAMES"
-        fi
+  case "$STATUS" in ORPHAN|EXPORT_FAILED|REF_CHECK_FAILED) ;; *) continue ;; esac
+  K="$T|$NAME"
+  P=$(count_parents "$T" "$NAME" "$SUB"); PAR[$K]="$P"
+  if [ "$STATUS" = "REF_CHECK_FAILED" ]; then
+    ACT[$K]="MANUELL_PRUEFEN"; HNT[$K]="Referenz-Ordner $RFOLDER nicht lesbar (fehlt oder pmrep-Fehler) - siehe log/list_*"
+  elif [ "$STATUS" = "EXPORT_FAILED" ] && [ $INCLUDE_SUSPECT -eq 0 ]; then
+    ACT[$K]="MANUELL_PRUEFEN"; HNT[$K]="Export fehlgeschlagen - Shortcut-Status unbekannt (--include-suspect zum Loeschen)"
+  elif [ "$P" = "?" ]; then
+    ACT[$K]="MANUELL_PRUEFEN"; HNT[$K]="Abhaengigkeiten nicht ermittelbar - siehe log/deps_*"
+  elif [ "$P" -gt 0 ]; then
+    ACT[$K]="REIMPORT"; HNT[$K]="wird noch von $P Objekt(en) verwendet - gestufter Ablauf in reimport_plan.txt"
+    write_reimport "$T" "$NAME" "$P"; n_reimp=$((n_reimp+1))
+  elif [[ "$DELETABLE" != *" $T "* ]]; then
+    ACT[$K]="MANUELL_PRUEFEN"; HNT[$K]="pmrep deleteobject unterstuetzt Typ $T nicht - im Designer loeschen"
+  else
+    ACT[$K]="LOESCHEN"
+    echo "$T|$NAME" >> "$DELETES"
+    echo "\"$PMREP\" deleteobject -o $T -f \"$FOLDER\" -n \"$NAME\"" >> "$PLAN"
+    n_del=$((n_del+1))
+  fi
+  [ "${ACT[$K]}" = "MANUELL_PRUEFEN" ] && n_man=$((n_man+1))
+done < "$ANALYSIS"
+
+# Durchlauf 2: Report in Original-Reihenfolge, Duplikate einordnen
+while IFS='|' read -r T NAME SUB STATUS RREPO RFOLDER RNAME RTYPE OSUB; do
+  K="$T|$NAME"; ACTION="${ACT[$K]:-KEINE}"; PARENTS="${PAR[$K]:-}"; HINT="${HNT[$K]:-}"
+  if [ "$STATUS" = "OK" ] || [ "$STATUS" = "GLOBAL_UNCHECKED" ]; then
+    n_ok=$((n_ok+1))
+    # Suffix-Duplikat eines verwaisten Shortcuts? (Name = Basisname + Ziffern)
+    if [[ "$NAME" =~ ^(.*[^0-9])([0-9]+)$ ]]; then
+      BASE="${BASH_REMATCH[1]}"; BACT="${ACT[$T|$BASE]:-}"
+      FROM=$(short_name "$T" "$NAME"); TO=$(short_name "$T" "$BASE")
+      if [ "$BACT" = "LOESCHEN" ]; then
+        ACTION="UMBENENNEN_IM_DESIGNER"; HINT="nach Loeschen von $TO umbenennen: $FROM -> $TO"
+        n_ren=$((n_ren+1))
+        echo "# Designer ($T): $FROM in $TO umbenennen (pmrep kann nicht umbenennen)" >> "$RENAMES"
+      elif [ -n "$BACT" ]; then
+        ACTION="NACH_BASIS_PRUEFEN"; HINT="Duplikat von $TO ($BACT) - erst $TO klaeren, dann $FROM loeschen oder umbenennen"
+        n_man=$((n_man+1))
       fi
-      ;;
-    ORPHAN|EXPORT_FAILED)
-      PARENTS=$(count_parents "$T" "$NAME" "$SUB")
-      if [ "$STATUS" = "EXPORT_FAILED" ] && [ $INCLUDE_SUSPECT -eq 0 ]; then
-        ACTION="MANUELL_PRUEFEN"; HINT="Export fehlgeschlagen - Shortcut-Status unbekannt (--include-suspect zum Loeschen)"
-      elif [[ "$DELETABLE" != *" $T "* ]]; then
-        ACTION="MANUELL_PRUEFEN"; HINT="pmrep deleteobject unterstuetzt Typ $T nicht - im Designer loeschen"
-      elif [ "$PARENTS" = "?" ]; then
-        ACTION="MANUELL_PRUEFEN"; HINT="Abhaengigkeiten nicht ermittelbar - siehe log/deps_*"
-      elif [ "$PARENTS" -gt 0 ]; then
-        ACTION="MANUELL_PRUEFEN"; HINT="wird noch von $PARENTS Objekt(en) verwendet - Mappings neu importieren (ctrl_reimport.xml)"
-      else
-        ACTION="LOESCHEN"
-        echo "$T|$NAME" >> "$DELETES"
-        echo "\"$PMREP\" deleteobject -o $T -f \"$FOLDER\" -n \"$NAME\"" >> "$PLAN"
-        n_del=$((n_del+1))
-      fi
-      [ "$ACTION" = "MANUELL_PRUEFEN" ] && n_man=$((n_man+1))
-      ;;
-  esac
+    fi
+  fi
   echo "$T;$NAME;$SUB;$STATUS;$RREPO;$RFOLDER;$RNAME;$PARENTS;$ACTION;$HINT" >> "$REPORT"
 done < "$ANALYSIS"
 
@@ -303,10 +365,18 @@ xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/"/\&quot;/g' -e 's/</
     [ -z "$SF" ] && continue
     echo "  <FOLDERMAP SOURCEFOLDERNAME=\"$(xml_esc "$SF")\" SOURCEREPOSITORYNAME=\"$(xml_esc "$SRC_REPO")\" TARGETFOLDERNAME=\"$(xml_esc "$SF")\" TARGETREPOSITORYNAME=\"$(xml_esc "${REPO:-$SRC_REPO}")\"/>"
   done
+  # verwaiste Shortcuts duerfen beim Import nicht mehr existieren (REUSE wuerde sie behalten,
+  # REPLACE ist bei Shortcuts nicht moeglich) -> vorher loeschen, siehe plan.txt / reimport_plan.txt
+  awk -F'|' '$4=="ORPHAN" || $4=="EXPORT_FAILED" || $4=="REF_CHECK_FAILED" {print $1 " " $2 " (" $4 ")"}' "$ANALYSIS" |
+    while IFS= read -r L; do echo "  <!-- vor dem Import loeschen/klaeren: $(printf '%s' "$L" | sed 's/--/- -/g') -->"; done
   echo '  <RESOLVECONFLICT>'
-  # Shortcuts nie ersetzen, sondern wiederverwenden (Basisname, ohne Zahlen-Suffix-Duplikate)
-  awk -F'|' '$4!="EXPORT_FAILED"' "$ANALYSIS" | while IFS='|' read -r T NAME SUB STATUS RREPO RFOLDER RNAME RTYPE OSUB; do
-    dup_base "$T" "$NAME" >/dev/null && continue
+  # gueltige Shortcuts nie ersetzen, sondern wiederverwenden (ohne Zahlen-Suffix-Duplikate)
+  awk -F'|' '$4=="OK" || $4=="GLOBAL_UNCHECKED"' "$ANALYSIS" | while IFS='|' read -r T NAME SUB STATUS RREPO RFOLDER RNAME RTYPE OSUB; do
+    if BASE=$(dup_base "$T" "$NAME"); then
+      # Duplikat: nur wenn es nach dem Loeschen des Originals auf den Basisnamen umbenannt wird
+      [ "${ACT[$T|$BASE]:-}" = "LOESCHEN" ] || continue
+      NAME="$BASE"
+    fi
     SN=$(short_name "$T" "$NAME")
     DBD=""; [ "$T" = "source" ] && [ "$NAME" != "$SN" ] && DBD=" DBDNAME=\"$(xml_esc "${NAME%%.*}")\""
     echo "    <SPECIFICOBJECT NAME=\"$(xml_esc "$SN")\"$DBD OBJECTTYPENAME=\"$(xml_esc "${OSUB:-$T}")\" FOLDERNAME=\"$(xml_esc "$FOLDER")\" REPOSITORYNAME=\"$(xml_esc "$SRC_REPO")\" RESOLUTION=\"REUSE\"/>"
@@ -318,10 +388,11 @@ xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/"/\&quot;/g' -e 's/</
 
 ### ---------------------------------------------------------------- 5. Zusammenfassung
 log ""
-log "[ERGEBNIS] - Shortcuts gueltig: $n_ok | zu loeschen: $n_del | manuell pruefen: $n_man | umbenennen (Designer): $n_ren"
+log "[ERGEBNIS] - Shortcuts gueltig: $n_ok | zu loeschen: $n_del | Re-Import noetig: $n_reimp | manuell pruefen: $n_man | umbenennen (Designer): $n_ren"
 log "[ERGEBNIS] - Report:       $REPORT"
 log "[ERGEBNIS] - Plan:         $PLAN"
 log "[ERGEBNIS] - Control-File: $CTRL"
+[ -s "$REIMPORT" ] && log "[ERGEBNIS] - Re-Import:    $REIMPORT  (gestufter Ablauf, wird nie automatisch ausgefuehrt)"
 if [ -s "$PLAN" ]; then log ""; log "----- Plan -----"; tee -a "$LOG" < "$PLAN"; log "----------------"; fi
 
 if [ $EXECUTE -eq 0 ]; then
